@@ -14,15 +14,11 @@ import json
 
 if TYPE_CHECKING:
     from pysui import SyncClient
-    from pysui.sui.sui_txn import SyncTransaction
-    from pysui.sui.sui_types import SuiAddress
-    from pysui.sui.sui_builders import GetCoins
+    from pysui.sui.sui_builders.get_builders import GetCoins
 
 try:
     from pysui import SyncClient
-    from pysui.sui.sui_txn import SyncTransaction
-    from pysui.sui.sui_types import SuiAddress
-    from pysui.sui.sui_builders import GetCoins
+    from pysui.sui.sui_builders.get_builders import GetCoins
     HAS_PYSUI = True
 except ImportError:
     HAS_PYSUI = False
@@ -34,9 +30,29 @@ def create_nonce() -> bytes:
 
 
 def prepare_payment_header(
-    sender_address: str, x402_version: int, payment_requirements: PaymentRequirements
+    account: Union[Account, "SyncClient"], x402_version: int, payment_requirements: PaymentRequirements
 ) -> Dict[str, Any]:
-    """Prepare an unsigned payment header with sender address, x402 version, and payment requirements."""
+    """Prepare an unsigned payment header with transaction data ready for signing.
+    
+    Dispatches to network-specific preparation methods.
+    """
+    network = payment_requirements.network.lower()
+    
+    if network in ['sui', 'sui-testnet']:
+        if not HAS_PYSUI:
+            raise ImportError("pysui package is required for Sui network support. Install it with: uv add pysui")
+        return _prepare_payment_header_sui(account, x402_version, payment_requirements)
+    else:
+        return _prepare_payment_header_evm(account, x402_version, payment_requirements)
+
+
+def _prepare_payment_header_evm(
+    account: Account, x402_version: int, payment_requirements: PaymentRequirements
+) -> Dict[str, Any]:
+    """Prepare an unsigned payment header for EVM networks.
+    
+    Creates the authorization structure that will be signed.
+    """
     nonce = create_nonce()
     valid_after = str(int(time.time()) - 60)  # 60 seconds before
     valid_before = str(int(time.time()) + payment_requirements.max_timeout_seconds)
@@ -48,13 +64,112 @@ def prepare_payment_header(
         "payload": {
             "signature": None,
             "authorization": {
-                "from": sender_address,
+                "from": account.address,
                 "to": payment_requirements.pay_to,
                 "value": payment_requirements.max_amount_required,
                 "validAfter": valid_after,
                 "validBefore": valid_before,
                 "nonce": nonce,
             },
+        },
+    }
+
+
+def _prepare_payment_header_sui(
+    client: "SyncClient", x402_version: int, payment_requirements: PaymentRequirements
+) -> Dict[str, Any]:
+    """Prepare an unsigned payment header for Sui networks.
+    
+    Builds the transaction and returns it ready for signing.
+    """
+    if not HAS_PYSUI:
+        raise ImportError("pysui package is required for Sui network support")
+    
+    # Get sender address from the client's active address
+    sender = client.config.active_address
+    
+    # Create a transfer transaction with initial sender
+    txn = client.transaction(initial_sender=sender)
+
+    # Get coins of the specified type for the sender
+    coin_type = payment_requirements.asset
+    amount_required = int(payment_requirements.max_amount_required)
+
+    # If the coin type is SUI, we can use the gas coin directly
+    if coin_type == "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI":
+        # Use gas coin for SUI transfers
+        coin_to_send = txn.split_coin(
+            coin=txn.gas,
+            amounts=[amount_required]
+        )
+    else:
+        # For other coin types, we need to get coins of that type
+        # Fetch the type coins with paging
+        coin_data = []
+        q_res = client.execute(GetCoins(owner=sender, coin_type=coin_type))
+        while q_res.is_ok() and q_res.result_data.data:
+            coin_data.extend(q_res.result_data.data)
+            if q_res.result_data.next_cursor:
+                q_res = client.execute(
+                    GetCoins(
+                        owner=sender,
+                        coin_type=coin_type,
+                        cursor=q_res.result_data.next_cursor,
+                    )
+                )
+            else:
+                break
+                
+        if not coin_data:
+            raise Exception(f"No coins of type {coin_type} found for address {sender}")
+
+        # Check if total balance meets requirement
+        total_balance = sum(int(coin.balance) for coin in coin_data)
+        if total_balance < amount_required:
+            raise Exception(
+                f"Insufficient balance. Required: {amount_required}, Available: {total_balance}"
+            )
+        
+        # First see if there is one coin that satisfies
+        sufficient_coin = next(
+            (coin for coin in coin_data if int(coin.balance) >= amount_required),
+            None,
+        )
+        
+        if sufficient_coin:
+            # Use the coin that has enough balance and split what we need
+            coin_to_send = txn.split_coin(
+                coin=sufficient_coin,
+                amounts=[amount_required]
+            )
+        else:
+            # Need to merge coins first
+            target_coin = coin_data[0]
+            # Merge other coins into the target
+            txn.merge_coins(merge_to=target_coin, merge_from=coin_data[1:])
+            # Split the required amount from the merged coin
+            coin_to_send = txn.split_coin(
+                coin=target_coin,
+                amounts=[amount_required]
+            )
+
+    # Transfer the coin to the recipient
+    from pysui.sui.sui_types import SuiAddress
+    txn.transfer_objects(
+        transfers=[coin_to_send],
+        recipient=SuiAddress(payment_requirements.pay_to)
+    )
+
+    # Build the transaction to get the bytes (but don't sign yet)
+    base64_tx_bytes = txn.deferred_execution()
+    
+    return {
+        "x402Version": x402_version,
+        "scheme": payment_requirements.scheme,
+        "network": payment_requirements.network,
+        "payload": {
+            "transaction": base64_tx_bytes,  # Base64 encoded transaction bytes
+            "signature": None,  # Will be added during signing
         },
     }
 
@@ -67,15 +182,14 @@ class PaymentHeader(TypedDict):
 
 
 def sign_payment_header(
-    account: Union[Account, "SyncClient"], payment_requirements: PaymentRequirements, header: PaymentHeader = None, x402_version: int = 1
+    account: Union[Account, "SyncClient"], payment_requirements: PaymentRequirements, header: PaymentHeader
 ) -> str:
     """Sign a payment header using the appropriate method based on the network.
 
     Args:
         account: Either an eth_account.Account for EVM networks or pysui.SyncClient for Sui networks
         payment_requirements: The payment requirements
-        header: Optional pre-built header (used for EVM networks)
-        x402_version: The version of the X402 protocol to use (default: 1)
+        header: Pre-built unsigned header from prepare_payment_header
 
     Returns:
         Base64 encoded payment header string
@@ -88,16 +202,11 @@ def sign_payment_header(
             raise ImportError("pysui package is required for Sui network support. Install it with: uv add pysui")
         if not isinstance(account, SyncClient):
             raise TypeError(f"Sui networks require a pysui.SyncClient instance, got {type(account)}")
-        return _sign_payment_header_sui(account, payment_requirements, x402_version)
+        return _sign_payment_header_sui(account, header)
     else:
         # Default to EVM signing for all other networks
         if not isinstance(account, Account):
             raise TypeError(f"EVM networks require an eth_account.Account instance, got {type(account)}")
-        if header is None:
-            # Create a header if not provided
-            header = prepare_payment_header(
-                account.address, x402_version, payment_requirements
-            )
         return _sign_payment_header_evm(account, payment_requirements, header)
 
 
@@ -158,100 +267,35 @@ def _sign_payment_header_evm(
 
 
 def _sign_payment_header_sui(
-    client: "SyncClient", payment_requirements: PaymentRequirements, x402_version: int
+    client: "SyncClient", header: PaymentHeader
 ) -> str:
     """Sign a payment header for Sui networks using pysui client.
 
-    This follows the TypeScript implementation pattern from typescript/packages/x402/src/schemes/exact/sui/client.ts
+    Takes the prepared transaction bytes and adds the signature.
     """
     if not HAS_PYSUI:
         raise ImportError("pysui package is required for Sui network support")
 
     try:
-        # Create a transfer transaction
-        txn = SyncTransaction(client=client)
-
-        # Get sender address from the client's active address
-        sender = client.active_address
-
-        # Get coins of the specified type for the sender
-        coin_type = payment_requirements.asset
-        amount_required = int(payment_requirements.max_amount_required)
-
-        # If the coin type is SUI, we can use the gas coin directly
-        if coin_type == "0x2::sui::SUI" or coin_type == "sui":
-            # Use gas coin for SUI transfers
-            coin_to_send = txn.split_coin(
-                coin=txn.gas,
-                amounts=[amount_required]
-            )
-        else:
-            # For other coin types, we need to get coins of that type
-            # Query for coins of the specified type owned by the sender
-            get_coins_result = client.execute(
-                GetCoins(
-                    owner=sender,
-                    coin_type=coin_type
-                )
-            )
-
-            if not get_coins_result.result or not get_coins_result.result.data:
-                raise Exception(f"No coins of type {coin_type} found for address {sender}")
-
-            coins = get_coins_result.result.data
-
-            # Calculate total balance
-            total_balance = sum(int(coin.balance) for coin in coins)
-
-            if total_balance < amount_required:
-                raise Exception(f"Insufficient balance. Required: {amount_required}, Available: {total_balance}")
-
-            # Need to merge coins first
-            # Take the first coin as the target
-            target_coin = coins[0]
-
-            # Merge other coins into the target
-            if len(coins) > 1:
-                merge_coins = [coin.coinObjectId for coin in coins[1:]]
-                txn.merge_coins(
-                    coin=target_coin.coinObjectId,
-                    coins_to_merge=merge_coins
-                )
-
-            # Now split the required amount from the merged coin
-            coin_to_send = txn.split_coin(
-                coin=target_coin.coinObjectId,
-                amounts=[amount_required]
-            )
-
-        # Transfer the coin to the recipient
-        txn.transfer_objects(
-            transfers=[coin_to_send],
-            recipient=SuiAddress(payment_requirements.pay_to)
+        # Get the transaction bytes from the prepared header
+        base64_tx_bytes = header["payload"]["transaction"]
+        
+        # We need to recreate a transaction to get its signer block
+        # since we can't serialize the transaction object itself
+        temp_txn = client.transaction(initial_sender=client.config.active_address)
+        
+        # Get signature using the transaction's signer block
+        signature = (
+            temp_txn.signer_block.get_signatures(client=client, tx_bytes=base64_tx_bytes)
+            .array[0]
+            .signature
         )
 
-        # Build and sign the transaction - this returns the transaction bytes and signature
-        result = client.execute_no_sign(txn)
-
-        if not result.is_ok():
-            raise Exception(f"Failed to execute transaction: {result.error}")
-
-        tx_bytes = result.data.serialize()
-        signed_tx = client.sign_for_execution(tx_bytes)
-
-        # Create the payment payload matching TypeScript structure
-        payment_payload = {
-            "scheme": payment_requirements.scheme,
-            "network": payment_requirements.network,
-            "x402Version": x402_version,
-            "payload": {
-                "transaction": signed_tx.tx_bytes,  # Base64 encoded transaction bytes
-                "signature": signed_tx.signature,    # Base64 encoded signature
-            }
-        }
+        # Update the header with the signature
+        header["payload"]["signature"] = signature
 
         # Encode and return
-        return encode_payment(payment_payload)
+        return encode_payment(header)
 
     except Exception as e:
         raise Exception(f"Failed to sign Sui payment header: {str(e)}") from e
