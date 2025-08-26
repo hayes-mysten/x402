@@ -2,6 +2,8 @@ import { encodePayment } from "../../utils";
 import { coinWithBalance, Transaction } from "@mysten/sui/transactions";
 import { ExactSuiPayload, PaymentPayload, PaymentRequirements } from "../../../types/verify";
 import { SuiWallet } from "../../../types/shared/sui";
+import { makePayment } from "./codegen/x402_payments/payments";
+import { getPackageId } from "./contract-config";
 
 /**
  * Creates and encodes a payment header for the given client and payment requirements.
@@ -61,14 +63,28 @@ async function createTransferTransaction(
 ): Promise<Transaction> {
   const tx = new Transaction();
   tx.setSender(sender);
-  tx.transferObjects(
-    [
-      coinWithBalance({
-        type: paymentRequirements.asset,
-        balance: BigInt(paymentRequirements.maxAmountRequired),
-      }),
-    ],
-    paymentRequirements.payTo,
+
+  const paymentCoin = coinWithBalance({
+    type: paymentRequirements.asset,
+    balance: BigInt(paymentRequirements.maxAmountRequired),
+  });
+
+  const nonce: string = paymentRequirements.extra?.nonce ?? "";
+  const invoiceIdBytes = new TextEncoder().encode(nonce);
+
+  const packageId = getPackageId(paymentRequirements.network);
+
+  tx.add(
+    makePayment({
+      package: packageId,
+      arguments: {
+        paymentCoin,
+        expectedAmount: BigInt(paymentRequirements.maxAmountRequired),
+        recipient: paymentRequirements.payTo,
+        invoiceId: invoiceIdBytes as unknown as Array<number>,
+      },
+      typeArguments: [paymentRequirements.asset],
+    }),
   );
 
   return tx;
