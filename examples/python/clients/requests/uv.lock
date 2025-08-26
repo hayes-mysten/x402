@@ -2298,7 +2298,6 @@ dependencies = [
     { name = "flask" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
-    { name = "pysui" },
     { name = "python-dotenv" },
     { name = "web3" },
 ]
@@ -2310,12 +2309,14 @@ requires-dist = [
     { name = "eth-utils", specifier = ">=3.0.0" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.115.12" },
     { name = "flask", specifier = ">=3.0.0" },
+    { name = "httpx", marker = "extra == 'sui'", specifier = "<0.28" },
     { name = "pydantic", specifier = ">=2.10.3" },
     { name = "pydantic-settings", specifier = ">=2.2.1" },
-    { name = "pysui", specifier = ">=0.88.0" },
+    { name = "pysui", marker = "extra == 'sui'", specifier = ">=0.51.2" },
     { name = "python-dotenv", specifier = ">=1.0.1" },
     { name = "web3", specifier = ">=6.0.0" },
 ]
+provides-extras = ["sui"]
 
 [package.metadata.requires-dev]
 dev = [

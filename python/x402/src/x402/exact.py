@@ -9,19 +9,28 @@ from x402.encoding import safe_base64_encode, safe_base64_decode
 from x402.types import (
     PaymentRequirements,
 )
-from x402.chains import get_chain_id
+from x402.chains import get_chain_id, get_sui_package_id
 import json
 
 if TYPE_CHECKING:
     from pysui import SyncClient
     from pysui.sui.sui_builders.get_builders import GetCoins
+    from pysui.sui.sui_types import SuiAddress, SuiU64, ObjectID
 
 try:
     from pysui import SyncClient
     from pysui.sui.sui_builders.get_builders import GetCoins
+    from pysui.sui.sui_types import SuiAddress, SuiU64, ObjectID
     HAS_PYSUI = True
 except ImportError:
     HAS_PYSUI = False
+    # Create dummy classes for type checking when pysui is not available
+    class SuiAddress:
+        pass
+    class SuiU64:
+        pass
+    class ObjectID:
+        pass
 
 
 def create_nonce() -> bytes:
@@ -80,7 +89,7 @@ def _prepare_payment_header_sui(
 ) -> Dict[str, Any]:
     """Prepare an unsigned payment header for Sui networks.
     
-    Builds the transaction and returns it ready for signing.
+    Builds a transaction that calls the x402 payments contract.
     """
     if not HAS_PYSUI:
         raise ImportError("pysui package is required for Sui network support")
@@ -88,76 +97,81 @@ def _prepare_payment_header_sui(
     # Get sender address from the client's active address
     sender = client.config.active_address
     
-    # Create a transfer transaction with initial sender
+    # Create a transaction with initial sender
     txn = client.transaction(initial_sender=sender)
 
-    # Get coins of the specified type for the sender
+    # Get contract package ID for this network
+    package_id = get_sui_package_id(payment_requirements.network)
+    
+    # Get payment parameters
     coin_type = payment_requirements.asset
     amount_required = int(payment_requirements.max_amount_required)
+    recipient = payment_requirements.pay_to
+    nonce = payment_requirements.extra.get('nonce', '') if payment_requirements.extra else ''
+    
+    # Prepare nonce bytes (encode as UTF-8)
+    nonce_bytes = list(nonce.encode('utf-8'))
 
-    # If the coin type is SUI, we can use the gas coin directly
-    if coin_type == "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI":
-        # Use gas coin for SUI transfers
-        coin_to_send = txn.split_coin(
-            coin=txn.gas,
-            amounts=[amount_required]
-        )
-    else:
-        # For other coin types, we need to get coins of that type
-        # Fetch the type coins with paging
-        coin_data = []
-        q_res = client.execute(GetCoins(owner=sender, coin_type=coin_type))
-        while q_res.is_ok() and q_res.result_data.data:
-            coin_data.extend(q_res.result_data.data)
-            if q_res.result_data.next_cursor:
-                q_res = client.execute(
-                    GetCoins(
-                        owner=sender,
-                        coin_type=coin_type,
-                        cursor=q_res.result_data.next_cursor,
-                    )
+    # Get coins of the specified type for the payment
+    coin_data = []
+    q_res = client.execute(GetCoins(owner=sender, coin_type=coin_type))
+    while q_res.is_ok() and q_res.result_data.data:
+        coin_data.extend(q_res.result_data.data)
+        if q_res.result_data.next_cursor:
+            q_res = client.execute(
+                GetCoins(
+                    owner=sender,
+                    coin_type=coin_type,
+                    cursor=q_res.result_data.next_cursor,
                 )
-            else:
-                break
-                
-        if not coin_data:
-            raise Exception(f"No coins of type {coin_type} found for address {sender}")
-
-        # Check if total balance meets requirement
-        total_balance = sum(int(coin.balance) for coin in coin_data)
-        if total_balance < amount_required:
-            raise Exception(
-                f"Insufficient balance. Required: {amount_required}, Available: {total_balance}"
-            )
-        
-        # First see if there is one coin that satisfies
-        sufficient_coin = next(
-            (coin for coin in coin_data if int(coin.balance) >= amount_required),
-            None,
-        )
-        
-        if sufficient_coin:
-            # Use the coin that has enough balance and split what we need
-            coin_to_send = txn.split_coin(
-                coin=sufficient_coin,
-                amounts=[amount_required]
             )
         else:
-            # Need to merge coins first
-            target_coin = coin_data[0]
-            # Merge other coins into the target
-            txn.merge_coins(merge_to=target_coin, merge_from=coin_data[1:])
-            # Split the required amount from the merged coin
-            coin_to_send = txn.split_coin(
-                coin=target_coin,
-                amounts=[amount_required]
-            )
+            break
+            
+    if not coin_data:
+        raise Exception(f"No coins of type {coin_type} found for address {sender}")
 
-    # Transfer the coin to the recipient
-    from pysui.sui.sui_types import SuiAddress
-    txn.transfer_objects(
-        transfers=[coin_to_send],
-        recipient=SuiAddress(payment_requirements.pay_to)
+    # Check if total balance meets requirement
+    total_balance = sum(int(coin.balance) for coin in coin_data)
+    if total_balance < amount_required:
+        raise Exception(
+            f"Insufficient balance. Required: {amount_required}, Available: {total_balance}"
+        )
+    
+    # Get a coin with sufficient balance or merge coins
+    sufficient_coin = next(
+        (coin for coin in coin_data if int(coin.balance) >= amount_required),
+        None,
+    )
+    
+    if sufficient_coin:
+        # Use the coin that has enough balance
+        if int(sufficient_coin.balance) == amount_required:
+            # Use the coin directly if it has the exact amount
+            payment_coin = ObjectID(sufficient_coin.object_id)
+        else:
+            # Split the coin to get the exact amount needed
+            split_coin = txn.split_coin(coin=ObjectID(sufficient_coin.object_id), amounts=[amount_required])
+            payment_coin = split_coin
+    else:
+        # Need to merge coins first
+        target_coin = coin_data[0]
+        # Merge other coins into the target
+        txn.merge_coins(merge_to=ObjectID(target_coin.object_id), merge_from=[ObjectID(c.object_id) for c in coin_data[1:]])
+        # Split the exact amount from the merged coin
+        split_coin = txn.split_coin(coin=ObjectID(target_coin.object_id), amounts=[amount_required])
+        payment_coin = split_coin
+
+    # Call the contract's make_payment function
+    txn.move_call(
+        target=f"{package_id}::payments::make_payment",
+        arguments=[
+            payment_coin,                    # paymentCoin (Coin object)
+            SuiU64(amount_required),        # expectedAmount (u64)
+            SuiAddress(recipient),          # recipient (address)
+            nonce_bytes,                    # invoiceId (vector<u8> as list of bytes)
+        ],
+        type_arguments=[coin_type]          # Coin type parameter
     )
 
     # Build the transaction to get the bytes (but don't sign yet)
