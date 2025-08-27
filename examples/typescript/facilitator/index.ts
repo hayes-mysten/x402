@@ -53,6 +53,8 @@ app.post("/verify", async (req: Request, res: Response) => {
     const body: VerifyRequest = req.body;
     const paymentRequirements = PaymentRequirementsSchema.parse(body.paymentRequirements);
     const paymentPayload = PaymentPayloadSchema.parse(body.paymentPayload);
+    console.log("[verify] Parsed payment requirements:", paymentRequirements);
+    console.log("[verify] Parsed payment payload:", paymentPayload);
 
     // use the correct client/signer based on the requested network
     // svm verify requires a Signer because it signs & simulates the txn
@@ -140,6 +142,8 @@ app.post("/settle", async (req: Request, res: Response) => {
     const body: SettleRequest = req.body;
     const paymentRequirements = PaymentRequirementsSchema.parse(body.paymentRequirements);
     const paymentPayload = PaymentPayloadSchema.parse(body.paymentPayload);
+    console.log("[settle] Parsed payment requirements:", paymentRequirements);
+    console.log("[settle] Parsed payment payload:", paymentPayload);
 
     // use the correct private key based on the requested network
     let signerOrClient: Signer | ConnectedClient;

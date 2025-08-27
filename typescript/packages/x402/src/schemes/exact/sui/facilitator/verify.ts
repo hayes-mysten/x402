@@ -11,8 +11,9 @@ import { SCHEME } from "../../";
 import { fromBase64, normalizeStructTag, normalizeSuiAddress } from "@mysten/sui/utils";
 import { bcs } from "@mysten/sui/bcs";
 import { BalanceChange, SuiClient, TransactionEffects } from "@mysten/sui/client";
-import { verifyTransactionSignature } from "@mysten/sui/verify";
+import { publicKeyFromRawBytes, verifyTransactionSignature } from "@mysten/sui/verify";
 import { getPackageId } from "../contract-config";
+import { parseSerializedSignature } from "@mysten/sui/cryptography";
 
 /**
  * Verify the payment payload against the payment requirements.
@@ -344,13 +345,36 @@ async function verifySignature(
   payer: string,
 ): Promise<void> {
   try {
+    const parse = parseSerializedSignature(signature);
+    console.log({ parse });
+
+    if (
+      parse.signatureScheme !== "ZkLogin" &&
+      parse.signatureScheme !== "Passkey" &&
+      parse.signatureScheme !== "MultiSig"
+    ) {
+      console.log(
+        "address",
+        publicKeyFromRawBytes(parse.signatureScheme, parse.publicKey).toSuiAddress(),
+      );
+    }
+    const pk = await verifyTransactionSignature(transactionBytes, signature, {
+      // RPC client is used when verifying zklogin signatures
+      client,
+      // address: payer,
+    });
+
+    console.log("got pk", pk.toSuiAddress());
+
     await verifyTransactionSignature(transactionBytes, signature, {
       // RPC client is used when verifying zklogin signatures
       client,
       address: payer,
     });
+
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
   } catch (error) {
+    console.error(error, payer);
     throw new Error(`invalid_exact_sui_payload_transaction_signature_verification_failed`);
   }
 }
