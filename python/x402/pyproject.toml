@@ -29,6 +29,12 @@ dependencies = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[project.optional-dependencies]
+sui = [
+    "httpx<0.28",  # pysui requirement
+    "pysui>=0.51.2",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.3.5",

@@ -5,6 +5,12 @@ NETWORK_TO_ID = {
     "avalanche": "43114",
 }
 
+# Sui contract package IDs by network
+SUI_PACKAGE_IDS = {
+    "sui": "0xe4ee6413abcbcaf7a7dfdc2beecc38d44008bfe0d3b294ea3d2a6c2f863256d6",  # mainnet
+    "sui-testnet": "0xb91e93029e6ff5c321731c07bcea75da5e1dba98f3b218c888043bbfb7ab31bb",  # testnet
+}
+
 
 def get_chain_id(network: str) -> str:
     """Get the chain ID for a given network
@@ -90,3 +96,10 @@ def get_default_token_address(chain_id: str, token_type: str = "usdc") -> str:
         if token["human_name"] == token_type:
             return token["address"]
     raise ValueError(f"Token type '{token_type}' not found for chain {chain_id}")
+
+
+def get_sui_package_id(network: str) -> str:
+    """Get the Sui contract package ID for a given network"""
+    if network not in SUI_PACKAGE_IDS:
+        raise ValueError(f"Unsupported Sui network: {network}")
+    return SUI_PACKAGE_IDS[network]
