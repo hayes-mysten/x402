@@ -41,20 +41,35 @@ app.use(express.json());
 type VerifyRequest = {
   paymentPayload: PaymentPayload;
   paymentRequirements: PaymentRequirements;
+  x402Version?: number; // Optional to support Python client format
 };
 
 type SettleRequest = {
   paymentPayload: PaymentPayload;
   paymentRequirements: PaymentRequirements;
+  x402Version?: number; // Optional to support Python client format
 };
 
 app.post("/verify", async (req: Request, res: Response) => {
   try {
+    console.log("[verify] Received request");
     const body: VerifyRequest = req.body;
     const paymentRequirements = PaymentRequirementsSchema.parse(body.paymentRequirements);
     const paymentPayload = PaymentPayloadSchema.parse(body.paymentPayload);
-    console.log("[verify] Parsed payment requirements:", paymentRequirements);
-    console.log("[verify] Parsed payment payload:", paymentPayload);
+    
+    console.log("[verify] Payment Requirements:", {
+      scheme: paymentRequirements.scheme,
+      network: paymentRequirements.network,
+      asset: paymentRequirements.asset,
+      payTo: paymentRequirements.payTo,
+      maxAmountRequired: paymentRequirements.maxAmountRequired,
+      extra: paymentRequirements.extra
+    });
+    console.log("[verify] Payment Payload:", {
+      scheme: paymentPayload.scheme,
+      network: paymentPayload.network,
+      payloadKeys: Object.keys(paymentPayload.payload)
+    });
 
     // use the correct client/signer based on the requested network
     // svm verify requires a Signer because it signs & simulates the txn
@@ -72,8 +87,10 @@ app.post("/verify", async (req: Request, res: Response) => {
     }
 
     const valid = await verify(client, paymentPayload, paymentRequirements);
+    console.log("[verify] Result:", valid);
     res.json(valid);
-  } catch {
+  } catch (error) {
+    console.error("[verify] Error:", error);
     res.status(400).json({ error: "Invalid request" });
   }
 });
@@ -169,6 +186,7 @@ app.post("/settle", async (req: Request, res: Response) => {
 // For local development
 if (process.env.NODE_ENV !== "production") {
   app.listen(process.env.PORT || 3000);
+  console.log(`[facilitator] Server is running on port ${process.env.PORT || 3000}`);
 }
 
 // For Vercel deployment

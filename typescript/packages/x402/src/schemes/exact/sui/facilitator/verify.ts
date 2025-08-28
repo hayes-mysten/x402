@@ -59,7 +59,6 @@ export async function verify(
       payer,
     };
   } catch (error) {
-    console.log("error", error);
     // if the error is one of the known error reasons, return the error reason
     if (error instanceof Error) {
       if (ErrorReasons.includes(error.message as (typeof ErrorReasons)[number])) {
@@ -163,8 +162,8 @@ export function verifyMoveCall(
   const expectedNonce = paymentRequirements.extra?.nonce ?? "";
   const expectedNonceBytes = new TextEncoder().encode(expectedNonce);
 
-  // Find the move call to our payments contract
-  let foundValidCall = false;
+  // Find all move calls to our payments contract and track validation errors
+  const validationErrors: string[] = [];
 
   for (const command of txData.commands) {
     if (command.$kind === "MoveCall") {
@@ -174,120 +173,131 @@ export function verifyMoveCall(
         command.MoveCall.module === "payments" &&
         command.MoveCall.function === "make_payment"
       ) {
-        // Verify the type arguments (coin type)
-        if (
-          command.MoveCall.typeArguments.length !== 1 ||
-          normalizeStructTag(command.MoveCall.typeArguments[0]) !==
-            normalizeStructTag(paymentRequirements.asset)
-        ) {
-          throw new Error(`invalid_exact_sui_payload_incorrect_coin_type`);
-        }
+        try {
+          // Verify the type arguments (coin type)
+          if (
+            command.MoveCall.typeArguments.length !== 1 ||
+            normalizeStructTag(command.MoveCall.typeArguments[0]) !==
+              normalizeStructTag(paymentRequirements.asset)
+          ) {
+            throw new Error(`invalid_exact_sui_payload_incorrect_coin_type`);
+          }
 
-        // Verify the arguments
-        // The makePayment function expects: paymentCoin, expectedAmount, recipient, invoiceId
-        const args = command.MoveCall.arguments;
-        if (args.length !== 4) {
-          throw new Error(`invalid_exact_sui_payload_incorrect_arguments`);
-        }
+          // Verify the arguments
+          // The makePayment function expects: paymentCoin, expectedAmount, recipient, invoiceId
+          const args = command.MoveCall.arguments;
+          if (args.length !== 4) {
+            throw new Error(`invalid_exact_sui_payload_incorrect_arguments`);
+          }
 
-        // Verify expectedAmount (args[1] should be an Input reference to a Pure value with the amount)
-        const expectedAmountArg = args[1];
-        let amountBytes: Uint8Array;
+          // Verify expectedAmount (args[1] should be an Input reference to a Pure value with the amount)
+          const expectedAmountArg = args[1];
+          let amountBytes: Uint8Array;
 
-        if (expectedAmountArg.$kind === "Input") {
-          // Look up the input in the transaction's inputs array
-          const inputIndex = expectedAmountArg.Input;
-          if (inputIndex < txData.inputs.length) {
-            const input = txData.inputs[inputIndex];
-            if (input.Pure) {
-              // The bytes are base64-encoded, need to decode first
-              amountBytes = fromBase64(input.Pure.bytes);
+          if (expectedAmountArg.$kind === "Input") {
+            // Look up the input in the transaction's inputs array
+            const inputIndex = expectedAmountArg.Input;
+            if (inputIndex < txData.inputs.length) {
+              const input = txData.inputs[inputIndex];
+              if (input.Pure) {
+                // The bytes are base64-encoded, need to decode first
+                amountBytes = fromBase64(input.Pure.bytes);
+              } else {
+                throw new Error(`invalid_exact_sui_payload_invalid_amount_argument`);
+              }
             } else {
               throw new Error(`invalid_exact_sui_payload_invalid_amount_argument`);
             }
           } else {
             throw new Error(`invalid_exact_sui_payload_invalid_amount_argument`);
           }
-        } else {
-          throw new Error(`invalid_exact_sui_payload_invalid_amount_argument`);
-        }
 
-        // Use BCS to parse the u64 amount
-        const amount = BigInt(bcs.u64().parse(amountBytes));
-        const expectedAmount = BigInt(paymentRequirements.maxAmountRequired);
+          // Use BCS to parse the u64 amount
+          const amount = BigInt(bcs.u64().parse(amountBytes));
+          const expectedAmount = BigInt(paymentRequirements.maxAmountRequired);
 
-        if (amount !== expectedAmount) {
-          throw new Error(`invalid_exact_sui_payload_amount_mismatch`);
-        }
+          if (amount !== expectedAmount) {
+            throw new Error(`invalid_exact_sui_payload_amount_mismatch`);
+          }
 
-        // Verify recipient (args[2] should be an Input reference to a Pure value with the address)
-        const recipientArg = args[2];
-        let recipientBytes: Uint8Array;
+          // Verify recipient (args[2] should be an Input reference to a Pure value with the address)
+          const recipientArg = args[2];
+          let recipientBytes: Uint8Array;
 
-        if (recipientArg.$kind === "Input") {
-          // Look up the input in the transaction's inputs array
-          const inputIndex = recipientArg.Input;
-          if (inputIndex < txData.inputs.length) {
-            const input = txData.inputs[inputIndex];
-            if (input.Pure) {
-              // The bytes are base64-encoded, need to decode first
-              recipientBytes = fromBase64(input.Pure.bytes);
+          if (recipientArg.$kind === "Input") {
+            // Look up the input in the transaction's inputs array
+            const inputIndex = recipientArg.Input;
+            if (inputIndex < txData.inputs.length) {
+              const input = txData.inputs[inputIndex];
+              if (input.Pure) {
+                // The bytes are base64-encoded, need to decode first
+                recipientBytes = fromBase64(input.Pure.bytes);
+              } else {
+                throw new Error(`invalid_exact_sui_payload_invalid_recipient_argument`);
+              }
             } else {
               throw new Error(`invalid_exact_sui_payload_invalid_recipient_argument`);
             }
           } else {
             throw new Error(`invalid_exact_sui_payload_invalid_recipient_argument`);
           }
-        } else {
-          throw new Error(`invalid_exact_sui_payload_invalid_recipient_argument`);
-        }
 
-        // Use BCS to parse the address
-        const recipientAddress = bcs.Address.parse(recipientBytes);
+          // Use BCS to parse the address
+          const recipientAddress = bcs.Address.parse(recipientBytes);
 
-        if (
-          normalizeSuiAddress(recipientAddress) !== normalizeSuiAddress(paymentRequirements.payTo)
-        ) {
-          throw new Error(`invalid_exact_sui_payload_incorrect_recipient`);
-        }
+          if (
+            normalizeSuiAddress(recipientAddress) !== normalizeSuiAddress(paymentRequirements.payTo)
+          ) {
+            throw new Error(`invalid_exact_sui_payload_incorrect_recipient`);
+          }
 
-        // Verify nonce/invoiceId (args[3] should be an Input reference to a Pure value with the nonce bytes)
-        const nonceArg = args[3];
-        let nonceBytes: Uint8Array;
+          // Verify nonce/invoiceId (args[3] should be an Input reference to a Pure value with the nonce bytes)
+          const nonceArg = args[3];
+          let nonceBytes: Uint8Array;
 
-        if (nonceArg.$kind === "Input") {
-          // Look up the input in the transaction's inputs array
-          const inputIndex = nonceArg.Input;
-          if (inputIndex < txData.inputs.length) {
-            const input = txData.inputs[inputIndex];
-            if (input.Pure) {
-              // The bytes are base64-encoded, need to decode first
-              nonceBytes = fromBase64(input.Pure.bytes);
+          if (nonceArg.$kind === "Input") {
+            // Look up the input in the transaction's inputs array
+            const inputIndex = nonceArg.Input;
+            if (inputIndex < txData.inputs.length) {
+              const input = txData.inputs[inputIndex];
+              if (input.Pure) {
+                // The bytes are base64-encoded, need to decode first
+                nonceBytes = fromBase64(input.Pure.bytes);
+              } else {
+                throw new Error(`invalid_exact_sui_payload_invalid_nonce_argument`);
+              }
             } else {
               throw new Error(`invalid_exact_sui_payload_invalid_nonce_argument`);
             }
           } else {
             throw new Error(`invalid_exact_sui_payload_invalid_nonce_argument`);
           }
-        } else {
-          throw new Error(`invalid_exact_sui_payload_invalid_nonce_argument`);
+
+          // Use BCS to parse the vector of bytes
+          const parsedNonceBytes = bcs.vector(bcs.u8()).parse(nonceBytes);
+
+          // Compare nonce bytes
+          if (!arraysEqual(parsedNonceBytes, expectedNonceBytes)) {
+            throw new Error(`invalid_exact_sui_payload_incorrect_nonce`);
+          }
+
+          // If we reach here, this move call is valid for the current payment requirements
+          return; // Found a valid call, no need to continue
+        } catch (error) {
+          // Track this validation error but continue checking other calls
+          if (error instanceof Error) {
+            validationErrors.push(error.message);
+          }
+          // Continue to next command without throwing - there might be other valid calls
         }
-
-        // Use BCS to parse the vector of bytes
-        const parsedNonceBytes = bcs.vector(bcs.u8()).parse(nonceBytes);
-
-        // Compare nonce bytes
-        if (!arraysEqual(parsedNonceBytes, expectedNonceBytes)) {
-          throw new Error(`invalid_exact_sui_payload_incorrect_nonce`);
-        }
-
-        foundValidCall = true;
-        break;
       }
     }
   }
 
-  if (!foundValidCall) {
+  // If we reach here, no valid call was found, throw the first error encountered
+  if (validationErrors.length > 0) {
+    throw new Error(validationErrors[0]);
+  } else {
     throw new Error(`invalid_exact_sui_payload_move_call_not_found`);
   }
 }
@@ -345,27 +355,6 @@ async function verifySignature(
   payer: string,
 ): Promise<void> {
   try {
-    const parse = parseSerializedSignature(signature);
-    console.log({ parse });
-
-    if (
-      parse.signatureScheme !== "ZkLogin" &&
-      parse.signatureScheme !== "Passkey" &&
-      parse.signatureScheme !== "MultiSig"
-    ) {
-      console.log(
-        "address",
-        publicKeyFromRawBytes(parse.signatureScheme, parse.publicKey).toSuiAddress(),
-      );
-    }
-    const pk = await verifyTransactionSignature(transactionBytes, signature, {
-      // RPC client is used when verifying zklogin signatures
-      client,
-      // address: payer,
-    });
-
-    console.log("got pk", pk.toSuiAddress());
-
     await verifyTransactionSignature(transactionBytes, signature, {
       // RPC client is used when verifying zklogin signatures
       client,
@@ -374,7 +363,6 @@ async function verifySignature(
 
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
   } catch (error) {
-    console.error(error, payer);
     throw new Error(`invalid_exact_sui_payload_transaction_signature_verification_failed`);
   }
 }

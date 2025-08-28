@@ -56,14 +56,29 @@ export async function settle(
       throw new Error("settle_exact_sui_transaction_execution_failed");
     }
 
-    if (!result.balanceChanges) {
+    // If balance changes are not available from executeTransactionBlock (e.g., already executed transaction),
+    // fetch them using waitForTransactionBlock
+    let balanceChanges = result.balanceChanges;
+    if (!balanceChanges && result.digest) {
+      console.log("[settle] Balance changes not found in execute result, fetching with waitForTransactionBlock");
+      const txResult = await client.waitForTransaction({
+        digest: result.digest,
+        options: {
+          showEffects: true,
+          showBalanceChanges: true,
+        },
+      });
+      balanceChanges = txResult.balanceChanges;
+    }
+
+    if (!balanceChanges) {
       throw new Error("settle_exact_sui_transaction_balance_changes_not_found");
     }
 
     // Verify the balance changes match the requirements
     verifyEffectsAndBalanceChanges(
       result.effects,
-      result.balanceChanges,
+      balanceChanges,
       paymentRequirements,
       "settle_exact_sui",
     );

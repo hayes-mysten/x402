@@ -336,3 +336,161 @@ def encode_payment(payment_payload: Dict[str, Any]) -> str:
 def decode_payment(encoded_payment: str) -> Dict[str, Any]:
     """Decode a base64 encoded payment string back into a PaymentPayload object."""
     return json.loads(safe_base64_decode(encoded_payment))
+
+
+def prepare_batch_payment_header(
+    client: "SyncClient", x402_version: int, payment_requirements_list: list[PaymentRequirements]
+) -> Dict[str, Any]:
+    """Prepare a batch payment header for multiple payments in a single SUI transaction.
+    
+    This function creates a single transaction that handles multiple payments by:
+    1. Calculating total amounts needed per asset type
+    2. Finding or merging coins to create sufficient balances
+    3. Splitting coins as needed for each payment
+    4. Making multiple move calls for each payment
+    
+    Args:
+        client: SUI client for transaction building
+        x402_version: X402 protocol version  
+        payment_requirements_list: List of payment requirements to process in batch
+        
+    Returns:
+        Payment header dict with transaction ready for signing
+    """
+    if not HAS_PYSUI:
+        raise ImportError("pysui package is required for Sui network support")
+    
+    if not payment_requirements_list:
+        raise ValueError("Payment requirements list cannot be empty")
+    
+    # Validate that all payments are for the same network
+    networks = {req.network for req in payment_requirements_list}
+    if len(networks) > 1:
+        raise ValueError(f"All payments must be for the same network. Found: {networks}")
+    
+    network = payment_requirements_list[0].network
+    sender = client.config.active_address
+    package_id = get_sui_package_id(network)
+    
+    # Create transaction
+    txn = client.transaction(initial_sender=sender)
+    
+    # Group payments by asset type and calculate total amounts needed
+    asset_totals = {}  # asset_type -> total_amount_needed
+    payments_by_asset = {}  # asset_type -> list of (requirements, index)
+    
+    for i, req in enumerate(payment_requirements_list):
+        asset_type = req.asset
+        amount = int(req.max_amount_required)
+        
+        if asset_type not in asset_totals:
+            asset_totals[asset_type] = 0
+            payments_by_asset[asset_type] = []
+        
+        asset_totals[asset_type] += amount
+        payments_by_asset[asset_type].append((req, i))
+    
+    # Prepare source coins for each asset type (find or merge to get sufficient balance)
+    source_coins = {}  # asset_type -> source_coin_object
+    
+    for asset_type, total_needed in asset_totals.items():
+        # Get all coins of this asset type
+        coin_data = []
+        q_res = client.execute(GetCoins(owner=sender, coin_type=asset_type))
+        while q_res.is_ok() and q_res.result_data.data:
+            coin_data.extend(q_res.result_data.data)
+            if q_res.result_data.next_cursor:
+                q_res = client.execute(
+                    GetCoins(
+                        owner=sender,
+                        coin_type=asset_type,
+                        cursor=q_res.result_data.next_cursor,
+                    )
+                )
+            else:
+                break
+        
+        if not coin_data:
+            raise Exception(f"No coins of type {asset_type} found for address {sender}")
+        
+        # Check total balance
+        total_balance = sum(int(coin.balance) for coin in coin_data)
+        if total_balance < total_needed:
+            raise Exception(
+                f"Insufficient balance for {asset_type}. Required: {total_needed}, Available: {total_balance}"
+            )
+        
+        # Find or create a source coin with sufficient balance
+        sufficient_coin = next(
+            (coin for coin in coin_data if int(coin.balance) >= total_needed),
+            None,
+        )
+        
+        if sufficient_coin:
+            # Use the sufficient coin as source
+            source_coins[asset_type] = ObjectID(sufficient_coin.object_id)
+        else:
+            # Need to merge coins first to get sufficient balance
+            target_coin = coin_data[0]
+            # Merge other coins into target
+            txn.merge_coins(
+                merge_to=ObjectID(target_coin.object_id),
+                merge_from=[ObjectID(c.object_id) for c in coin_data[1:]]
+            )
+            source_coins[asset_type] = ObjectID(target_coin.object_id)
+    
+    # Split all coins for each asset type in one batch, maintaining proper mapping
+    payment_coins = {}  # original_index -> split_coin_object
+    
+    for asset_type, payments in payments_by_asset.items():
+        source_coin = source_coins[asset_type]
+        
+        # Collect amounts and preserve original indices for this asset type
+        amounts = []
+        original_indices = []
+        for req, orig_idx in payments:
+            amounts.append(int(req.max_amount_required))
+            original_indices.append(orig_idx)
+        
+        # Do a single split_coin call with all amounts for this asset type
+        split_coins = txn.split_coin(coin=source_coin, amounts=amounts)
+        
+        # Map each split coin back to its original payment index
+        for split_idx, orig_idx in enumerate(original_indices):
+            payment_coins[orig_idx] = split_coins[split_idx]
+    
+    # Now make payment calls in original order using the properly mapped split coins
+    for i, req in enumerate(payment_requirements_list):
+        asset_type = req.asset
+        amount_required = int(req.max_amount_required)
+        recipient = req.pay_to
+        nonce = req.extra.get('nonce', '') if req.extra else ''
+        nonce_bytes = list(nonce.encode('utf-8'))
+        
+        # Get the split coin that corresponds to this original payment index
+        payment_coin = payment_coins[i]
+        
+        # Call the contract's make_payment function
+        txn.move_call(
+            target=f"{package_id}::payments::make_payment",
+            arguments=[
+                payment_coin,                   # paymentCoin (Coin object)
+                SuiU64(amount_required),       # expectedAmount (u64)
+                SuiAddress(recipient),         # recipient (address)
+                nonce_bytes,                   # invoiceId (vector<u8>)
+            ],
+            type_arguments=[asset_type]        # Coin type parameter
+        )
+    
+    # Build the transaction bytes (but don't sign yet)
+    base64_tx_bytes = txn.deferred_execution()
+    
+    return {
+        "x402Version": x402_version,
+        "scheme": payment_requirements_list[0].scheme,  # Assume all same scheme
+        "network": network,
+        "payload": {
+            "transaction": base64_tx_bytes,
+            "signature": None,  # Will be added during signing
+        },
+    }
