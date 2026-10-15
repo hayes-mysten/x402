@@ -108,12 +108,10 @@ export class ExactSuiScheme implements SchemeNetworkServer {
       ...supportedKind.extra,
     };
 
-    if (BigInt(paymentRequirements.amount) <= 0n) {
-      return Promise.reject(
-        new Error(
-          `invalid_payment_requirements: amount must be positive, got ${paymentRequirements.amount}`,
-        ),
-      );
+    try {
+      this.assertPositiveAmount(paymentRequirements.amount);
+    } catch (error) {
+      return Promise.reject(error);
     }
 
     return Promise.resolve({ ...paymentRequirements, extra });
@@ -134,7 +132,7 @@ export class ExactSuiScheme implements SchemeNetworkServer {
   }
 
   /**
-   * Default money conversion — to atomic USDC on the network.
+   * Default money conversion to atomic USDC on the network.
    *
    * @param amount - The decimal amount
    * @param network - The CAIP-2 network identifier
@@ -153,7 +151,9 @@ export class ExactSuiScheme implements SchemeNetworkServer {
    */
   private assertPositiveAmount(amount: string): void {
     if (!/^[0-9]+$/.test(amount) || BigInt(amount) <= 0n) {
-      throw new Error(`Amount must be a positive atomic-unit integer: ${amount}`);
+      throw new Error(
+        `invalid_payment_requirements: amount must be a positive integer, got ${amount}`,
+      );
     }
   }
 

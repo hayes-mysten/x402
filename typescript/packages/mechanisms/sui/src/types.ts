@@ -1,7 +1,8 @@
 import type { ClientWithCoreApi, SuiClientTypes } from "@mysten/sui/client";
 
 /**
- * Exact Sui payload: a fully signed, ready-to-broadcast transaction.
+ * Exact Sui payload: the client-signed transaction. On a facilitator-sponsored
+ * payment the sponsor's signature is added at settlement.
  */
 export type ExactSuiPayload = {
   /**
@@ -9,16 +10,16 @@ export type ExactSuiPayload = {
    */
   transaction: string;
   /**
-   * Base64-encoded serialized signature(s) over the transaction bytes. A single
-   * string is the sole sender signature; an array carries multiple required
-   * signers (e.g. a sponsored transaction whose sponsor is a distinct signer).
+   * Base64-encoded serialized signature(s) over the transaction bytes. An array
+   * is needed when a second signer the client controls, such as its own gas
+   * sponsor, must sign. A single string is equivalent to a one-element array.
    */
   signature: string | string[];
 };
 
 /**
  * The result of a {@link SuiExecutor}: the submitted transaction, an on-chain
- * failure, or a policy rejection. Balance changes need not be included — the
+ * failure, or a policy rejection. Balance changes need not be included; the
  * facilitator reads them from `waitForTransaction`.
  */
 export type SuiExecutorResult =
@@ -27,12 +28,8 @@ export type SuiExecutorResult =
   | { $kind: "Rejected"; reason?: string; issues?: ReadonlyArray<{ message?: string }> };
 
 /**
- * A pluggable executor settlement is delegated to. It receives the signed bytes
- * and the user signatures, submits (or delegates submission — a gas sponsor, for
- * example, co-signs under its own policy), and returns the submitted transaction,
- * an on-chain failure, or a rejection. When no executor is configured, the
- * facilitator broadcasts directly via the network client. The facilitator then
- * waits for finality and reads balance changes from the finalized transaction.
+ * Submits facilitator-sponsored transactions, for example a gas sponsor that
+ * adds its signature. Required when `feePayer` is set.
  */
 export type SuiExecutor = (input: {
   transaction: Uint8Array;
@@ -40,36 +37,43 @@ export type SuiExecutor = (input: {
 }) => Promise<SuiExecutorResult>;
 
 /**
- * The identity of a settlement for deduplication: the transaction digest, plus
- * the declared server nonce when present (which a shared guard MAY use for
- * invoice or challenge reconciliation).
+ * The identity of a settlement. `maxEpoch` is the transaction's last valid
+ * epoch: a claim must be kept until that epoch has ended.
  */
 export type SettlementKey = {
+  network: string;
   digest: string;
-  nonce?: string;
+  maxEpoch: string;
 };
 
 /**
- * A dedup guard consulted at the top of settle. The default in-process
- * implementation covers a single process; a scaled facilitator SHOULD supply a
- * shared implementation (e.g. Redis) for cross-instance serving.
+ * Records which transactions have been settled so the facilitator reports
+ * success at most once per digest. The facilitator claims a key before
+ * submitting and releases it when settlement does not succeed. Keep a
+ * successful claim until the network is two epochs past `maxEpoch`: one epoch
+ * for the window to end, and one of margin for a lagging fullnode. The default
+ * in-process {@link SettlementCache} is enough for a single facilitator process.
  */
 export interface SettlementGuard {
   /**
-   * Atomically record the settlement as in-progress. Returns `true` when it was
-   * already present (a duplicate the caller MUST reject), `false` otherwise. May
-   * be async so a shared store (e.g. Redis) can back it.
+   * Atomically claim a key.
    *
-   * @param payment - The settlement identity (digest, and nonce when declared)
-   * @returns Whether it was already present
+   * @param key - The settlement identity
+   * @returns `true` if the key was claimed, `false` if it is already held
    */
-  isDuplicate(payment: SettlementKey): boolean | Promise<boolean>;
+  claim(key: SettlementKey): boolean | Promise<boolean>;
+
+  /**
+   * Release a claimed key after a settlement that did not succeed.
+   *
+   * @param key - The settlement identity
+   */
+  release(key: SettlementKey): void | Promise<void>;
 }
 
 /**
- * Options shared by the client and facilitator schemes: per-network Sui client
- * overrides. Any client implementing the core API works (gRPC, GraphQL, ...);
- * networks without an override fall back to a gRPC client for the default
+ * Per-network Sui client overrides. Any client implementing the core API works
+ * (gRPC, GraphQL). Networks without an override use a gRPC client for the
  * public fullnode.
  */
 export type SuiClientOptions = {
@@ -80,23 +84,25 @@ export type SuiClientOptions = {
 };
 
 /**
- * Facilitator options: client overrides, an optional custom executor and
- * advertised fee-payer address, and a settlement dedup guard.
+ * Facilitator options.
  */
 export type FacilitatorSuiOptions = SuiClientOptions & {
   /**
-   * Optional executor settlement is delegated to (e.g. a gas sponsor). When
-   * absent, the facilitator broadcasts directly via the network client.
+   * Submits facilitator-sponsored transactions. Required when `feePayer` is set.
    */
   executeTransaction?: SuiExecutor;
   /**
-   * Optional gas-sponsor address advertised as `extra.feePayer`, so clients build
-   * sponsored transactions with it as the gas owner. Independent of
-   * `executeTransaction`.
+   * Gas sponsor address advertised as `extra.feePayer`. Clients set it as the
+   * gas owner, and `executeTransaction` must add its signature.
    */
   feePayer?: string;
   /**
-   * Settlement dedup guard. Defaults to an in-process, digest-keyed cache.
+   * Largest gas budget, in MIST, accepted on a sponsored payment. Defaults to
+   * {@link DEFAULT_MAX_SPONSORED_GAS_BUDGET}.
+   */
+  maxSponsoredGasBudget?: bigint;
+  /**
+   * Settlement dedup guard. Defaults to an in-process {@link SettlementCache}.
    */
   settlementGuard?: SettlementGuard;
 };

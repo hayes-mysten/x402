@@ -37,7 +37,7 @@ describe("ExactSuiScheme server", () => {
       );
       await expect(
         scheme.parsePrice({ amount: "0", asset: USDC_TESTNET }, SUI_TESTNET_CAIP2),
-      ).rejects.toThrow("positive");
+      ).rejects.toThrow("invalid_payment_requirements: amount must be a positive integer");
     });
   });
 
@@ -72,7 +72,10 @@ describe("ExactSuiScheme server", () => {
     it("rejects a non-positive amount", async () => {
       await expect(
         scheme.enhancePaymentRequirements(testRequirements({ amount: "0" }), supportedKind, []),
-      ).rejects.toThrow("invalid_payment_requirements");
+      ).rejects.toThrow("invalid_payment_requirements: amount must be a positive integer");
+      await expect(
+        scheme.enhancePaymentRequirements(testRequirements({ amount: "1.5" }), supportedKind, []),
+      ).rejects.toThrow("invalid_payment_requirements: amount must be a positive integer");
     });
   });
 });

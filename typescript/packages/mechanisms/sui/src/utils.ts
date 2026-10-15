@@ -79,8 +79,9 @@ export function createSuiClientResolver(
 }
 
 /**
- * Decode a Base64 string into bytes; no size cap. Returns null for a non-string,
- * an empty value, or one that is not valid Base64.
+ * Decode a Base64 string into bytes. Returns null for a non-string, an empty
+ * value, or one that is not valid Base64. The length is not limited here;
+ * callers that care, such as the gasless 32-byte rule, check it themselves.
  *
  * @param value - The Base64 value
  * @returns The decoded bytes, or null when malformed
@@ -111,9 +112,9 @@ export function pureInputsBase64(data: ReturnType<Transaction["getData"]>): stri
 }
 
 /**
- * Whether the transaction carries `nonceBase64` as a `Pure` input. Compares
- * Base64 strings directly — both sides are SDK-canonical — canonicalizing the
- * declared nonce once so a byte-equal value matches.
+ * Whether the transaction carries `nonceBase64` as a `Pure` input.
+ * Re-encodes the declared nonce so it matches the SDK's Base64 form for the
+ * same bytes, then compares strings.
  *
  * @param data - The decoded transaction data (`Transaction.getData()`)
  * @param nonceBase64 - The declared server nonce (Base64)
@@ -133,9 +134,9 @@ export function transactionCarriesNonce(
 }
 
 /**
- * The exact-payment effects check: assert `payTo`'s net balance change in the
- * requested asset equals exactly `amount`. Recipient-credit-only — it does not
- * constrain the payer's debit or forbid other credits.
+ * The exact-payment effects check: the sum of `payTo`'s balance changes in the
+ * requested asset must equal exactly `amount`. Only the recipient's credit is
+ * checked; the payer's debit and other credits are not constrained.
  *
  * @param balanceChanges - Balance changes from a simulation or executed transaction
  * @param asset - The required coin type
@@ -153,13 +154,12 @@ export function matchExactPayment(
   const recipient = normalizeSuiAddress(payTo);
   const want = BigInt(amount);
 
-  // Sui emits at most one balance change per (coinType, address), so the
-  // recipient's credit is a single entry, not a sum.
-  const change = balanceChanges.find(
-    c =>
-      normalizeStructTag(c.coinType) === coinType && normalizeSuiAddress(c.address) === recipient,
-  );
-  const got = change ? BigInt(change.amount) : 0n;
+  const got = balanceChanges
+    .filter(
+      c =>
+        normalizeStructTag(c.coinType) === coinType && normalizeSuiAddress(c.address) === recipient,
+    )
+    .reduce((sum, c) => sum + BigInt(c.amount), 0n);
 
   if (got !== want) {
     return `recipient ${payTo} credited ${got}, expected exactly ${want}`;

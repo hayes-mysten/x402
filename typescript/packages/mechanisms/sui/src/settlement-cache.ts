@@ -1,48 +1,61 @@
 import type { SettlementGuard, SettlementKey } from "./types";
 
 /**
- * Default TTL for settlement dedup entries (ms). Sized to exceed a typical
- * freshness window so a payment cannot be settled twice within its own validity.
- */
-export const SETTLEMENT_TTL_MS = 10 * 60 * 1000;
-
-/**
- * In-process settlement dedup keyed on the transaction digest. Prevents one
- * facilitator process from settling the same payment twice — the check-plus-insert
- * is synchronous, so it runs before the first `await` in settle. Not
- * cross-instance: a scaled facilitator supplies a shared `SettlementGuard`.
+ * In-process settlement guard. Successful claims are kept as long as
+ * {@link SettlementGuard} requires. Not shared across processes: a horizontally
+ * scaled facilitator supplies its own {@link SettlementGuard}.
  */
 export class SettlementCache implements SettlementGuard {
-  private readonly entries = new Map<string, number>();
+  private readonly entries = new Map<string, { network: string; maxEpoch: bigint }>();
+  private readonly latestEpoch = new Map<string, bigint>();
 
   /**
-   * Create a settlement cache.
+   * Claim a key. The check and insert are synchronous, so concurrent settles of
+   * the same transaction cannot both claim it.
    *
-   * @param ttlMs - Entry lifetime in milliseconds
+   * @param key - The settlement identity
+   * @returns `true` if claimed, `false` if already held
    */
-  constructor(private readonly ttlMs: number = SETTLEMENT_TTL_MS) {}
-
-  /**
-   * Returns `true` if the settlement's digest is already pending (a duplicate),
-   * or `false` after recording it as newly pending.
-   *
-   * @param payment - The settlement identity; keyed on `digest`
-   * @returns Whether the digest was already present
-   */
-  isDuplicate(payment: SettlementKey): boolean {
-    this.prune();
-    if (this.entries.has(payment.digest)) return true;
-    this.entries.set(payment.digest, Date.now());
-    return false;
+  claim(key: SettlementKey): boolean {
+    const id = cacheKey(key);
+    if (this.entries.has(id)) return false;
+    this.entries.set(id, { network: key.network, maxEpoch: BigInt(key.maxEpoch) });
+    return true;
   }
 
   /**
-   * Remove entries older than the TTL.
+   * Drop a claim so the transaction can be settled again.
+   *
+   * @param key - The settlement identity
    */
-  private prune(): void {
-    const cutoff = Date.now() - this.ttlMs;
-    for (const [key, timestamp] of this.entries) {
-      if (timestamp < cutoff) this.entries.delete(key);
+  release(key: SettlementKey): void {
+    this.entries.delete(cacheKey(key));
+  }
+
+  /**
+   * Record the network's current epoch, and drop claims that no longer need to
+   * be kept (see {@link SettlementGuard}).
+   *
+   * @param network - The CAIP-2 network id
+   * @param epoch - The current epoch reported by the network
+   */
+  observeEpoch(network: string, epoch: string | bigint): void {
+    const observed = BigInt(epoch);
+    const previous = this.latestEpoch.get(network);
+    if (previous !== undefined && observed <= previous) return;
+    this.latestEpoch.set(network, observed);
+    for (const [id, entry] of this.entries) {
+      if (entry.network === network && entry.maxEpoch + 1n < observed) this.entries.delete(id);
     }
   }
+}
+
+/**
+ * The map key for a settlement: network and digest.
+ *
+ * @param key - The settlement identity
+ * @returns The map key
+ */
+function cacheKey(key: SettlementKey): string {
+  return `${key.network}:${key.digest}`;
 }

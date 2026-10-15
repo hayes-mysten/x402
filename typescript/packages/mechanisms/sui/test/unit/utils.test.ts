@@ -81,6 +81,15 @@ describe("matchExactPayment", () => {
     { coinType: USDC_TESTNET, address: payTo, amount: "10000" },
   ];
 
+  it("sums every entry for the recipient", () => {
+    const split = [
+      { coinType: USDC_TESTNET, address: payTo, amount: "4000" },
+      { coinType: USDC_TESTNET, address: payTo, amount: "6000" },
+    ];
+    expect(matchExactPayment(split, USDC_TESTNET, payTo, "10000")).toBeNull();
+    expect(matchExactPayment(split, USDC_TESTNET, payTo, "4000")).not.toBeNull();
+  });
+
   it("accepts an exact single payment", () => {
     expect(matchExactPayment(single, USDC_TESTNET, payTo, "10000")).toBeNull();
   });

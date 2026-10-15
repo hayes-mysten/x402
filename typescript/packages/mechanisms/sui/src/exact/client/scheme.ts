@@ -1,7 +1,9 @@
 import type { Signer } from "@mysten/sui/cryptography";
 import { Transaction } from "@mysten/sui/transactions";
-import { isValidSuiAddress, normalizeStructTag, toBase64 } from "@mysten/sui/utils";
+import type { ClientWithCoreApi } from "@mysten/sui/client";
+import { fromBase64, isValidSuiAddress, normalizeStructTag } from "@mysten/sui/utils";
 import type {
+  Network,
   PaymentPayloadResult,
   PaymentRequirements,
   SchemeNetworkClient,
@@ -11,15 +13,15 @@ import { createSuiClientResolver, parseBase64Bytes, type SuiClientResolver } fro
 
 /**
  * Sui client implementation for the Exact payment scheme. Builds and signs (but
- * does not execute) a transaction whose effects transfer `amount` to `payTo`,
- * sourced via the SDK's `tx.balance()` input. When the requirements announce a
- * `feePayer` it sets the sponsor as gas owner; when they declare a server
- * `nonce` its bytes ride as a `Pure` input.
+ * does not execute) a `balance::send_funds` of `amount` to `payTo`, valid for
+ * the current and next epoch. An advertised `feePayer` becomes the gas owner,
+ * and a declared server `nonce` is carried as a `Pure` input.
  */
 export class ExactSuiScheme implements SchemeNetworkClient {
   readonly scheme = "exact";
 
   private readonly getClient: SuiClientResolver;
+  private readonly chainIds = new Map<Network, Promise<string>>();
 
   /**
    * Creates a new ExactSuiScheme client instance.
@@ -57,9 +59,7 @@ export class ExactSuiScheme implements SchemeNetworkClient {
     }
     const coinType = normalizeStructTag(asset);
 
-    // Decode the declared server nonce (Base64) so it can ride as an unused Pure
-    // input below. A nonce beyond 32 bytes stays valid but may forfeit gasless
-    // eligibility (see NONCE_GASLESS_PURE_BYTES).
+    // A nonce over 32 bytes is valid but forfeits gasless (NONCE_GASLESS_PURE_BYTES).
     const declaredNonce = paymentRequirements.extra?.nonce;
     let nonceBytes: Uint8Array | undefined;
     if (declaredNonce !== undefined) {
@@ -70,39 +70,98 @@ export class ExactSuiScheme implements SchemeNetworkClient {
       nonceBytes = parsed;
     }
 
+    const feePayer = paymentRequirements.extra?.feePayer;
+    const sponsored = typeof feePayer === "string";
+
     const tx = new Transaction();
     tx.setSender(this.signer.toSuiAddress());
     tx.moveCall({
       target: "0x2::balance::send_funds",
       typeArguments: [coinType],
-      arguments: [tx.balance({ type: coinType, balance: BigInt(amount) }), tx.pure.address(payTo)],
+      arguments: [
+        // The sponsor rejects use of its gas coin, so a SUI payment must not draw on it.
+        tx.balance({ type: coinType, balance: BigInt(amount), useGasCoin: !sponsored }),
+        tx.pure.address(payTo),
+      ],
     });
-    // Passed as raw bytes (no BCS length prefix) so the decoded `Pure.bytes` is
-    // exactly the nonce.
+    // Raw bytes, not a BCS vector, so the decoded `Pure.bytes` is exactly the nonce.
     if (nonceBytes) {
       tx.pure(nonceBytes);
     }
 
-    // When the requirements announce a sponsor, set it as gas owner with empty
-    // gas payment (Address Balance gas); the sponsor co-signs at settlement.
-    const feePayer = paymentRequirements.extra?.feePayer;
-    if (typeof feePayer === "string") {
+    // The sponsor pays gas from its address balance and co-signs at settlement.
+    if (sponsored) {
       tx.setGasOwner(feePayer);
       tx.setGasPayment([]);
     }
 
     const client = this.getClient(network);
+    const [{ systemState }, chain] = await Promise.all([
+      client.core.getCurrentSystemState(),
+      this.getChainIdentifier(network, client),
+    ]);
+    const epoch = BigInt(systemState.epoch);
+    tx.setExpiration({
+      ValidDuring: {
+        minEpoch: String(epoch),
+        maxEpoch: String(epoch + 1n),
+        minTimestamp: null,
+        maxTimestamp: null,
+        chain,
+        nonce: (Math.random() * 0x100000000) >>> 0,
+      },
+    });
+
     const bytes = await tx.build({ client });
-    const { signature } = await this.signer.signTransaction(bytes);
+    // A wallet-backed signer may return different bytes than it was given; the
+    // signature covers the returned ones.
+    const signed = await this.signer.signTransaction(bytes);
+    if (sponsored) {
+      assertWithinGasCap(fromBase64(signed.bytes), paymentRequirements.extra?.maxGasBudget);
+    }
 
     const payload: ExactSuiPayload = {
-      transaction: toBase64(bytes),
-      signature,
+      transaction: signed.bytes,
+      signature: signed.signature,
     };
 
     return {
       x402Version,
       payload,
     };
+  }
+
+  /**
+   * The network's chain identifier, fetched once per network.
+   *
+   * @param network - The CAIP-2 network id
+   * @param client - The Sui client for the network
+   * @returns The chain identifier
+   */
+  private getChainIdentifier(network: Network, client: ClientWithCoreApi): Promise<string> {
+    let chainId = this.chainIds.get(network);
+    if (!chainId) {
+      chainId = client.core.getChainIdentifier().then(r => r.chainIdentifier);
+      chainId.catch(() => this.chainIds.delete(network));
+      this.chainIds.set(network, chainId);
+    }
+    return chainId;
+  }
+}
+
+/**
+ * Throw when a sponsored transaction's budget exceeds the advertised cap.
+ *
+ * @param bytes - The built transaction bytes
+ * @param maxGasBudget - The facilitator's `extra.maxGasBudget`, if any
+ */
+function assertWithinGasCap(bytes: Uint8Array, maxGasBudget: unknown): void {
+  if (maxGasBudget === undefined) return;
+  if (typeof maxGasBudget !== "string" || !/^[0-9]+$/.test(maxGasBudget)) {
+    throw new Error(`Invalid maxGasBudget in requirements: ${String(maxGasBudget)}`);
+  }
+  const budget = BigInt(Transaction.from(bytes).getData().gasData.budget ?? 0);
+  if (budget > BigInt(maxGasBudget)) {
+    throw new Error(`Gas budget ${budget} exceeds the sponsor's maxGasBudget ${maxGasBudget}`);
   }
 }

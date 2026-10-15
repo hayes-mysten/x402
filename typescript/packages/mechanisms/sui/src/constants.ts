@@ -16,13 +16,13 @@ export const SUI_TESTNET_CAIP2 = "sui:testnet";
 export const SUI_DEVNET_CAIP2 = "sui:devnet";
 
 /**
- * Native Circle USDC on Sui mainnet (CCTP).
+ * Circle USDC on Sui mainnet.
  */
 export const USDC_MAINNET =
   "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC";
 
 /**
- * Circle native USDC on Sui testnet.
+ * Circle USDC on Sui testnet.
  */
 export const USDC_TESTNET =
   "0xa1ec7fc00a6f40db9693ad1415d0c193ad3906494428cf252621037bd7117e29::usdc::USDC";
@@ -42,11 +42,19 @@ export const SUI_FULLNODE_URLS: Record<string, string> = {
 };
 
 /**
- * Recommended maximum byte length of the optional server nonce (`extra.nonce`)
- * for gasless eligibility: a gasless transaction may carry one unused `Pure`
- * input of at most 32 bytes. A recommendation, not a facilitator-enforced cap.
+ * Largest server nonce (`extra.nonce`), in bytes, that keeps a payment eligible
+ * for gasless execution. Gasless requires every `Pure` input, used or not, to be
+ * at most 32 bytes, and allows at most one unused `Pure` input. Not enforced by
+ * the facilitator.
  */
 export const NONCE_GASLESS_PURE_BYTES = 32;
+
+/**
+ * Default cap, in MIST, on the gas budget of a sponsored payment (0.01 SUI).
+ * A sponsored `send_funds` budgets about 2,000 gas units times the gas price:
+ * roughly 200,000 MIST on mainnet and 2,000,000 MIST on testnet.
+ */
+export const DEFAULT_MAX_SPONSORED_GAS_BUDGET = 10_000_000n;
 
 /**
  * Get the default USDC coin type for a network. Devnet has no canonical USDC:

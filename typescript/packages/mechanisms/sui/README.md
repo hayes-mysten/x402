@@ -1,6 +1,8 @@
 # `@x402/sui` [![npm version](https://img.shields.io/npm/v/%40x402%2Fsui.svg)](https://www.npmjs.com/package/@x402/sui)
 
-Sui implementation of the x402 `exact` payment scheme.
+Sui implementation of the x402 `exact` payment scheme. The facilitator accepts any transaction whose effects credit `payTo` with exactly `amount`, so a payment may be funded from an address balance, coins, swaps, or withdrawals.
+
+Supports `sui:mainnet`, `sui:testnet`, and `sui:devnet`.
 
 ## Installation
 
@@ -21,14 +23,12 @@ import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
 import { x402Client } from "@x402/core/client";
 import { ExactSuiScheme } from "@x402/sui/exact/client";
 
-// Any Sui signer works — Ed25519, Secp256k1, or a wallet-backed signer.
+// Any Sui signer works: Ed25519, Secp256k1, or a wallet-backed signer.
 const keypair = Ed25519Keypair.generate();
 const client = new x402Client().register("sui:*", new ExactSuiScheme(keypair));
-
-// On a 402 response, `client` builds and signs the payment transaction from the
-// returned PaymentRequirements — sourcing the asset and arranging gas per the
-// requirements — then retries the request with the signed PaymentPayload.
 ```
+
+On a 402 response the client builds a transaction that calls `balance::send_funds` for the required amount to `payTo`, and signs it. The transaction carries a `ValidDuring` expiration covering the current and next epoch. When the requirements advertise `extra.feePayer`, the sponsor is set as gas owner with an empty gas payment, and the client refuses to sign if the gas budget exceeds the advertised `extra.maxGasBudget`.
 
 ### Server
 
@@ -40,8 +40,7 @@ const server = new x402ResourceServer({
   facilitatorUrl: "https://facilitator.example",
 }).register("sui:*", new ExactSuiScheme());
 
-// Price resources in USDC — "$0.01" or an explicit { amount, asset }. The scheme
-// converts the price to atomic units in the PaymentRequirements it builds.
+// Price resources in USDC ("$0.01") or with an explicit { amount, asset }.
 ```
 
 ### Facilitator
@@ -51,13 +50,6 @@ import { SuiGrpcClient } from "@mysten/sui/grpc";
 import { x402Facilitator } from "@x402/core/facilitator";
 import { ExactSuiScheme } from "@x402/sui/exact/facilitator";
 
-// No key is needed for self-paid or gasless payments. All options are optional:
-//   clients             per-network Sui client overrides (any core-API client);
-//                       networks without one fall back to the public fullnode
-//   executeTransaction  a custom executor settlement is delegated to (e.g. a gas
-//                       sponsor); absent, the facilitator broadcasts directly
-//   feePayer            a sponsor address to advertise as `extra.feePayer`
-//   settlementGuard     a dedup guard (default: in-process, digest-keyed)
 const facilitator = new x402Facilitator().register(
   "sui:*",
   new ExactSuiScheme({
@@ -68,40 +60,83 @@ const facilitator = new x402Facilitator().register(
 );
 ```
 
+No key is needed unless the facilitator sponsors gas. Options:
+
+- `clients`: per-network Sui clients (gRPC or GraphQL). Networks without one use the public fullnode over gRPC.
+- `feePayer`: a gas sponsor address, advertised as `extra.feePayer`.
+- `executeTransaction`: submits facilitator-sponsored payments. Required when `feePayer` is set.
+- `maxSponsoredGasBudget`: the gas budget cap for sponsored payments, in MIST, advertised as `extra.maxGasBudget`. Defaults to `10_000_000n` (0.01 SUI).
+- `settlementGuard`: settlement deduplication. Defaults to an in-process guard.
+
+The facilitator rejects a transaction without a `ValidDuring` or `Validity` expiration, or one that is not valid in at most two consecutive epochs (`maxEpoch - minEpoch <= 1`). Settlement also requires the current epoch to be inside that window.
+
+When `asset` is SUI and `payTo` is the gas owner, the payment can't match: gas nets into the same balance change, so `payTo` is never credited exactly `amount`.
+
+Signatures are verified with the Sui SDK. A multisig signer with a zkLogin member currently fails because of a `@mysten/sui` bug: multisig verification does not pass the Sui client to its member keys, which zkLogin verification needs. It will work once a `@mysten/sui` release with the fix is out, with no change needed in x402.
+
 #### Gas sponsorship
 
-Advertise a `feePayer` (which clients set as the gas owner) and supply an `executeTransaction` that co-signs the gas. The executor is a plain function that submits the signed bytes and returns the result; a gas sponsor is one example:
+Set `feePayer` to the sponsor's address and supply an `executeTransaction` that adds the sponsor's signature and submits. With the [`@mysten-incubation/sponsor`](https://www.npmjs.com/package/@mysten-incubation/sponsor) SDK:
 
 ```typescript
+import { createSponsor, defaults, gasBudget } from "@mysten-incubation/sponsor";
 import type { SuiExecutor } from "@x402/sui";
 
-// e.g. wrap the mysten-incubation sponsor SDK's createSponsor(...).
+const sponsor = createSponsor({
+  signer: sponsorKeypair,
+  client,
+  validate: [defaults(), gasBudget({ max: 10_000_000n })],
+});
+
 const executeTransaction: SuiExecutor = ({ transaction, signatures }) =>
   sponsor.signAndExecuteTransaction({ transaction, userSignature: signatures });
 
-new ExactSuiScheme({ feePayer: sponsorAddress, executeTransaction });
+new ExactSuiScheme({ feePayer: sponsor.address, executeTransaction });
 ```
 
-#### Cross-instance dedup
+The sponsor address SHOULD be dedicated to paying gas, with no roles or privileges in other contracts, since Move code can read it with `tx_context::sponsor()`.
 
-A horizontally-scaled facilitator should supply a shared `settlementGuard` so a payment can't be served twice across instances. It is keyed on the tx digest (with the declared nonce when present):
+> **Note:** passing `validate` replaces the sponsor's default validators. Keep `defaults()` in the list unless you mean to drop those checks.
+
+The executor is used only for payments whose gas owner is `feePayer` and not the sender. Their payload carries only the payer's signature; the executor adds the sponsor's. Other payments are submitted directly. Before co-signing, the facilitator runs the sponsorship checks:
+
+- The gas payment must be empty, so gas comes from the sponsor's address balance.
+- The gas budget must not exceed `maxSponsoredGasBudget`.
+- No command may use the gas coin.
+- No input may withdraw funds from the sponsor, directly or through an allowance it funds.
+
+A failed check returns `invalid_exact_sui_payload_sponsorship_rejected`, and a rejection from the executor itself returns `sponsor_rejected`.
+
+A sponsored transaction that fails because the payer's address balance can't cover the withdrawal does not run and is not charged gas. One that aborts during execution costs up to its signed budget, which the budget cap and the sponsor's rate limiting bound.
+
+Per-sender rate limiting is left to the executor or sponsor.
+
+#### Settlement deduplication
+
+Re-submitting an executed Sui transaction returns its original result, so the facilitator claims each transaction digest before submitting. A second settle of the same transaction fails with `duplicate_settlement`. The claim is released if settlement fails. If it succeeds, the claim is kept for as long as the `SettlementGuard` documentation requires. If the outcome can't be determined, settlement fails with the digest in `transaction` so the caller can reconcile.
+
+The default in-process guard is all a single facilitator process needs. If the process restarts and forgets its claims, `verify` still rejects a payment that already executed (`invalid_exact_sui_payload_already_executed`), and the standard resource server flow verifies before it settles. A facilitator that runs several instances, or whose `settle` can be called without `verify`, should share the claims in a durable store, for example Redis:
 
 ```typescript
 import type { SettlementGuard } from "@x402/sui";
 
+// Covers the retention SettlementGuard requires; mainnet epochs last about
+// 24 hours, so four days leaves room to spare.
+const CLAIM_TTL_SECONDS = 4 * 24 * 60 * 60;
+
 const settlementGuard: SettlementGuard = {
-  // Atomic reserve, e.g. Redis SET NX; true when the digest was already present.
-  async isDuplicate({ digest }) {
-    return (await redis.set(`settle:${digest}`, "1", { NX: true, EX: 600 })) === null;
+  async claim({ network, digest }) {
+    const set = await redis.set(`x402:sui:${network}:${digest}`, "1", {
+      NX: true,
+      EX: CLAIM_TTL_SECONDS,
+    });
+    return set !== null;
+  },
+  async release({ network, digest }) {
+    await redis.del(`x402:sui:${network}:${digest}`);
   },
 };
 ```
-
-## Features
-
-- **Effects-only verification**: the facilitator checks that `payTo` is credited exactly `amount` from the transaction's `balanceChanges`, not how the transaction is built — so payments may be sourced from an Address Balance, coins, swaps, or withdrawals.
-- **Gas sponsorship**: optional, advertised as `extra.feePayer`; settlement is delegated to a custom `executeTransaction` (e.g. a gas sponsor that co-signs under its own policy).
-- **Network support**: Mainnet (`sui:mainnet`), Testnet (`sui:testnet`), and Devnet (`sui:devnet`).
 
 ## Testnet Resources
 

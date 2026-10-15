@@ -1,6 +1,6 @@
 {
   "name": "@x402/sui",
-  "version": "0.1.0",
+  "version": "2.21.0",
   "main": "./dist/cjs/index.js",
   "module": "./dist/esm/index.js",
   "types": "./dist/cjs/index.d.ts",
@@ -42,7 +42,7 @@
   },
   "dependencies": {
     "@x402/core": "workspace:~",
-    "@mysten/sui": "2.23.1"
+    "@mysten/sui": "^2.35.0"
   },
   "exports": {
     ".": {
