@@ -6,7 +6,7 @@ import {
   USDC_MAINNET,
   USDC_TESTNET,
 } from "../../src/constants";
-import { testRequirements } from "./helpers";
+import { feePayer, payTo, testRequirements } from "./helpers";
 
 const supportedKind = { x402Version: 2, scheme: "exact", network: SUI_TESTNET_CAIP2 };
 
@@ -82,6 +82,67 @@ describe("ExactSuiScheme server", () => {
       await expect(
         scheme.enhancePaymentRequirements(testRequirements({ amount: "1.5" }), supportedKind, []),
       ).rejects.toThrow("invalid_payment_requirements: amount must be a positive integer");
+    });
+
+    describe("splits", () => {
+      const splits = [{ payTo: "0x1", amount: "1", memo: "fee" }];
+
+      it("refuses splits when the facilitator does not advertise maxSplits", async () => {
+        await expect(
+          scheme.enhancePaymentRequirements(
+            testRequirements({ extra: { splits } }),
+            supportedKind,
+            [],
+          ),
+        ).rejects.toThrow(
+          "invalid_payment_requirements: 1 splits, but the facilitator does not accept splits",
+        );
+      });
+
+      it("refuses more splits than the facilitator advertises", async () => {
+        await expect(
+          scheme.enhancePaymentRequirements(
+            testRequirements({
+              extra: {
+                splits: [
+                  { payTo: "0x1", amount: "1" },
+                  { payTo: "0x2", amount: "1" },
+                ],
+              },
+            }),
+            { ...supportedKind, extra: { maxSplits: 1 } },
+            [],
+          ),
+        ).rejects.toThrow("facilitator accepts at most 1");
+      });
+
+      it("refuses splits that break the rules", async () => {
+        await expect(
+          scheme.enhancePaymentRequirements(
+            testRequirements({ extra: { splits: [{ payTo, amount: "1" }] } }),
+            { ...supportedKind, extra: { maxSplits: 8 } },
+            [],
+          ),
+        ).rejects.toThrow("duplicates another recipient");
+      });
+
+      it("passes splits through without copying maxSplits", async () => {
+        const enhanced = await scheme.enhancePaymentRequirements(
+          testRequirements({ extra: { splits } }),
+          { ...supportedKind, extra: { maxSplits: 8, feePayer, maxGasBudget: "10000000" } },
+          [],
+        );
+        expect(enhanced.extra).toEqual({ splits, feePayer, maxGasBudget: "10000000" });
+      });
+
+      it("allows an empty splits array without maxSplits", async () => {
+        const enhanced = await scheme.enhancePaymentRequirements(
+          testRequirements({ extra: { splits: [] } }),
+          supportedKind,
+          [],
+        );
+        expect(enhanced.extra?.splits).toEqual([]);
+      });
     });
   });
 });

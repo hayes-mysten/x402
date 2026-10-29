@@ -9,7 +9,8 @@ bytes and, when it sponsors gas, co-signs as the gas owner.
 
 Verification is effects-only: it checks only the outcome, that the transaction's balance changes
 credit `payTo` with exactly `amount`, not how the transaction is built. A payment can draw the asset
-from an address balance, `Coin<T>` objects, a swap, a contract withdrawal, or any mix.
+from an address balance, `Coin<T>` objects, a swap, a contract withdrawal, or any mix. With
+[splits](#splits), the same check covers each recipient's share.
 
 ## Terminology
 
@@ -42,8 +43,8 @@ Sui has one method, in the facilitator-submitted family of [`exact`](./scheme_ex
 1. Client requests a resource and receives a `402 Payment Required` response with the
    `PaymentRequirements`.
 2. Client queries a Sui RPC for the current epoch and any balance or gas data it needs.
-3. Client builds a transaction that credits `payTo` with exactly `amount` and arranges gas (see
-   [Gas](#gas)).
+3. Client builds a transaction that credits `payTo`, and each split recipient, with its share of
+   `amount` and arranges gas (see [Gas](#gas)).
 4. Client signs the transaction and resends the request with the `PaymentPayload`.
 5. Resource server asks the facilitator to verify the payload.
 6. Resource server fulfills the request.
@@ -80,8 +81,9 @@ x402 v2 uses CAIP-2 network identifiers:
 
 - `asset`: The coin type `T`, as a normalized Sui struct tag.
 - `payTo`: The recipient address.
-- `amount`: The exact amount in atomic units, as a positive decimal string. A resource server
-  refuses to build requirements with any other amount.
+- `amount`: The exact total the payer pays, in atomic units, as a positive decimal string. With
+  splits, `payTo` receives the remainder. A resource server refuses to build requirements with any
+  other amount.
 - `extra.feePayer` (optional): The facilitator's sponsor address. The facilitator advertises it in
   `/supported` and the resource server copies it into the requirements. See
   [Gas sponsorship](#gas-sponsorship).
@@ -89,6 +91,7 @@ x402 v2 uses CAIP-2 network identifiers:
   string. Present whenever `extra.feePayer` is. A client using the sponsor MUST NOT exceed it.
 - `extra.nonce` (optional): A Base64-encoded, server-issued value that binds the payment to its
   challenge. See [Server-issued nonce](#server-issued-nonce).
+- `extra.splits` (optional): Additional recipients that share `amount`. See [Splits](#splits).
 
 A resource server MUST NOT put the epoch or other build hints in `extra`: the server compares the
 client's `accepted.extra` to its own by value, and the epoch changes every 24 hours.
@@ -135,10 +138,10 @@ Full `PaymentPayload` object:
 
 ## Construction
 
-The client builds one Sui transaction whose effects credit `payTo` with exactly `amount` of `asset`.
-Because verification is effects-only, the asset source is unconstrained.
-`tx.balance({ type, balance })` in the Sui SDK picks the source (address balance or coins)
-automatically.
+The client builds one Sui transaction whose effects credit `payTo` with exactly `amount` of `asset`,
+or, with [splits](#splits), each recipient with exactly its share. Because verification is
+effects-only, the asset source is unconstrained. `tx.balance({ type, balance })` in the Sui SDK
+picks the source (address balance or coins) automatically.
 
 ### Expiration
 
@@ -231,8 +234,99 @@ full rules. In summary, a gasless transfer:
 - has every `Pure` input at most 32 bytes, with at most one unused;
 - creates or mutates no objects, so an on-chain receipt object forfeits gasless.
 
+With splits, the minimum applies to each recipient's share, the remainder included.
+
 Gasless transactions are deprioritized under congestion. A gas-price-0 transaction that breaks a
 rule is rejected, not charged.
+
+## Splits
+
+A resource server MAY split one payment between `payTo` and up to 8 other recipients. This binds the
+[multi-payee splits extension](./scheme_exact.md#multi-payee-splits-optional-extension) to Sui. The
+whole payment is one transaction, so every recipient is paid or none is.
+
+### `extra.splits`
+
+```json
+{
+  "scheme": "exact",
+  "network": "sui:mainnet",
+  "amount": "1050000",
+  "asset": "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC",
+  "payTo": "0x1eb7c57e3f2bd0fc6cb9dcffd143ea957e4d98f805c358733f76dee0667fe0b1",
+  "maxTimeoutSeconds": 60,
+  "extra": {
+    "splits": [
+      {
+        "payTo": "0x369cf71b2f13b63c165c207bc3f263b1df9da754ca6a2d09300d9b4bf45f62f0",
+        "amount": "50000",
+        "memo": "platform fee"
+      }
+    ]
+  }
+}
+```
+
+The payer pays `1050000` in total: `50000` to the split recipient and the remaining `1000000` to
+`payTo`.
+
+- `splits[].payTo`: The recipient address.
+- `splits[].amount`: The recipient's share in atomic units of `asset`, as an absolute amount.
+- `splits[].memo` (optional): A label for the share, at most 566 bytes in UTF-8. It is not put on
+  chain.
+
+An absent or empty `splits` means a single-recipient payment.
+
+### Requirements rules
+
+- `splits` is an array of at most 8 entries, and no more than the facilitator advertises.
+- Each entry is an object with `payTo`, `amount`, and optionally `memo`, and no other fields.
+- Each `payTo` is a valid Sui address.
+- Each `amount` is a positive decimal integer no greater than `2^64 - 1`, with no sign, decimal
+  point, exponent, or leading zeros.
+- `payTo` receives the remainder, `amount - Σ splits[].amount`, which MUST be greater than zero.
+- All recipients, `payTo` included, MUST be distinct. Addresses are compared in normalized form
+  (`0x` and 64 lowercase hex digits).
+
+Requirements that break a rule are invalid (`invalid_payment_requirements`). There is no rounding. A
+server that computes shares as percentages rounds them before it builds the requirements, and the
+remainder to `payTo` absorbs the difference.
+
+### Advertisement
+
+A facilitator that accepts splits advertises `maxSplits`, an integer from 1 to 8, in the `extra` of
+its `/supported` kind. Absent or 0 means it accepts no splits. A facilitator MUST reject
+requirements whose `splits` has more entries than it accepts (`invalid_payment_requirements`). A
+resource server MUST NOT build requirements that exceed what its facilitator advertises, and does
+not copy `maxSplits` into the requirements. `maxSplits` does not depend on `feePayer`; a
+facilitator that does not sponsor gas can still accept splits.
+
+### Client
+
+Before signing, the client MUST check that the split recipients, amounts, and memos are ones it
+agreed to, and that the remainder is what reaches `payTo`. It shows a memo next to the address, not
+in place of it. A client that cannot check them MUST NOT pay.
+
+The client credits each recipient with its share. In the Sui SDK, one `0x2::balance::send_funds<T>`
+per recipient does this, each funded by its own `tx.balance({ type, balance })`. A sponsored payment
+passes `useGasCoin: false` to each. Sui allows at most 10 balance withdrawals in a transaction,
+counting gas paid from an address balance, so this construction fits 9 recipients.
+
+A split payment is eligible for [gasless](#gasless-transfers) execution only when every share,
+including the remainder, meets the network minimum. A resource server that expects gasless clients
+SHOULD keep every share at or above it.
+
+### Effects with splits
+
+The [effects check](#effects-check) runs once per recipient: `payTo` MUST net exactly the
+remainder, and each split recipient exactly its `amount`. Because recipients are distinct and
+balance changes are netted per address, each share is checked against its own balance change.
+
+Netting has consequences for the server:
+
+- A payment whose sender is a recipient cannot match.
+- When `asset` is SUI, a payment whose gas owner is a recipient cannot match. A sponsor can be a
+  split recipient, for example to recover its gas cost, only when `asset` is not SUI.
 
 ## Verification
 
@@ -244,7 +338,8 @@ The facilitator returns a `VerifyResponse` (core spec [§5.4](../../x402-specifi
    be a supported Sui network (`invalid_network`). The payload MUST be `{ transaction, signature }`
    (`invalid_payload`), and the transaction bytes MUST decode
    (`invalid_exact_sui_payload_transaction_could_not_be_decoded`). The requirements' `amount` MUST
-   be a positive integer (`invalid_payment_requirements`).
+   be a positive integer, and a non-empty `extra.splits` MUST pass the
+   [splits rules](#requirements-rules) (`invalid_payment_requirements`).
 2. **Signatures.** The transaction MUST have a `sender`
    (`invalid_exact_sui_payload_missing_sender`). The payload MUST carry exactly one valid signature
    per required signer, as described in [`payload`](#paymentpayload-payload-field)
@@ -273,11 +368,13 @@ Any other error during verification returns `invalid_exact_sui_payload_verificat
 ### Effects check
 
 A balance change is `{ coinType, address, amount }`. Sui nets balance changes per address and coin
-type, so there is normally one entry for `payTo`; the facilitator sums any entries for `payTo` in
-`asset` (zero if there are none) and requires the total to equal `amount` exactly
+type. For each recipient the facilitator sums its entries in `asset` (zero if there are none) and
+requires the total to equal that recipient's share exactly
 (`invalid_exact_sui_payload_transfer_mismatch` on a simulation, `settlement_effects_mismatch` on
-executed effects). It does not check the payer's debit or other recipients. When `asset` is SUI and
-`payTo` is the gas owner, gas nets into the same balance change, so the payment cannot match.
+executed effects). Without splits, the only recipient is `payTo` and its share is `amount`. With
+splits, see [Effects with splits](#effects-with-splits). The facilitator does not check the payer's
+debit or credits to other addresses. Because balance changes are net, a recipient that is also the
+sender, or that is the gas owner when `asset` is SUI, cannot match.
 
 The facilitator MUST request balance changes where the transport makes them opt-in. At verify it
 MUST reject the payment when they are unavailable. At settle, if the execution result lacks balance
@@ -336,9 +433,11 @@ success at most once per transaction:
 - **Authorization scope.** The payer signs the complete transaction, so no other party can redirect
   the payment or reduce the recipient's credit.
 - **Atomicity.** A Sui programmable transaction is all-or-nothing, so the credit lands in full or
-  not at all.
+  not at all. With splits, every recipient is paid or none is.
 - **Cross-network replay.** `ValidDuring` and `Validity` carry the chain identifier, so a payment
   signed for one network cannot execute on another.
+- **Split consent.** The resource server chooses the split recipients. The client MUST check them
+  before signing (see [Client](#client)).
 - **Sponsor address.** The sponsor address SHOULD be dedicated to gas, with no roles or privileges
   elsewhere, since Move code can read `tx_context::sponsor()`.
 
@@ -365,10 +464,10 @@ Replay and repeat settlement are covered under [Expiration](#expiration) and
 | `invalid_exact_sui_payload_sponsorship_rejected`             | verify / settle | A sponsored transaction fails the sponsorship checks.                                       |
 | `invalid_exact_sui_payload_already_executed`                 | verify          | Transaction has already executed.                                                           |
 | `invalid_exact_sui_payload_simulation_failed`                | verify          | Simulation failed, including for an expired transaction.                                    |
-| `invalid_exact_sui_payload_transfer_mismatch`                | verify          | Simulated effects do not credit `payTo` with exactly `amount`.                              |
+| `invalid_exact_sui_payload_transfer_mismatch`                | verify          | Simulated effects do not credit each recipient with exactly its share.                      |
 | `invalid_exact_sui_payload_verification_error`               | verify          | Unexpected error or RPC failure during verification.                                        |
-| `invalid_payment_requirements`                               | verify / settle | `amount` is not a positive integer.                                                         |
+| `invalid_payment_requirements`                               | verify / settle | `amount` is not a positive integer, or `extra.splits` breaks the splits rules.              |
 | `sponsor_rejected`                                           | settle          | The sponsor declined the transaction.                                                       |
 | `duplicate_settlement`                                       | settle          | The transaction has already settled successfully, or a settle for it is in progress.        |
 | `transaction_failed`                                         | settle          | Execution failed or outcome unknown, balance changes missing, or a signature check errored. |
-| `settlement_effects_mismatch`                                | settle          | Executed effects do not credit `payTo` with exactly `amount`.                               |
+| `settlement_effects_mismatch`                                | settle          | Executed effects do not credit each recipient with exactly its share.                       |

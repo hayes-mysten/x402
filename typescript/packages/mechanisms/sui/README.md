@@ -68,6 +68,7 @@ No key is needed unless the facilitator sponsors gas. Options:
 - `feePayer`: a gas sponsor address, advertised as `extra.feePayer`.
 - `executeTransaction`: submits facilitator-sponsored payments. Required when `feePayer` is set.
 - `maxSponsoredGasBudget`: the gas budget cap for sponsored payments, in MIST, advertised as `extra.maxGasBudget`. Defaults to `10_000_000n` (0.01 SUI).
+- `maxSplits`: the most `extra.splits` entries accepted, 0 to 8, advertised as `maxSplits`. Defaults to 0 (no splits). See [Multi-payee splits](#multi-payee-splits).
 - `settlementGuard`: settlement deduplication. Defaults to an in-process guard.
 
 The facilitator rejects a transaction without a `ValidDuring` or `Validity` expiration, or one that is not valid in at most two consecutive epochs (`maxEpoch - minEpoch <= 1`). Settlement also requires the current epoch to be inside that window.
@@ -137,6 +138,30 @@ const settlementGuard: SettlementGuard = {
   },
 };
 ```
+
+## Multi-payee splits
+
+One payment can pay `payTo` and up to 8 other recipients in a single transaction, as specified in [scheme_exact_sui.md](../../../../specs/schemes/exact/scheme_exact_sui.md#splits). The server lists each split with an absolute amount in the route's `extra`. `amount` stays the total the payer pays, and `payTo` receives the remainder.
+
+```typescript
+price: {
+  amount: "1050000",
+  asset: USDC_MAINNET,
+  extra: { splits: [{ payTo: platformAddress, amount: "50000", memo: "platform fee" }] },
+},
+```
+
+- **Facilitator**: splits are off by default. Pass `maxSplits` (1 to 8) to accept them; it is advertised in `/supported` whether or not the facilitator sponsors gas. Verification checks that `payTo` nets exactly the remainder and each split recipient exactly its amount. Bad splits return `invalid_payment_requirements`.
+- **Server**: `enhancePaymentRequirements` throws when the splits break the rules or exceed the facilitator's advertised `maxSplits`.
+- **Client**: requirements with splits are refused unless the client options set `approveSplits`, which receives every split and the remainder reaching `payTo`, and must return `true` only for terms the payer agreed to. The client builds one `balance::send_funds` per recipient.
+
+```typescript
+new ExactSuiScheme(keypair, {
+  approveSplits: splits => splits.every(split => trustedRecipients.has(split.payTo)),
+});
+```
+
+Recipients must be distinct. Balance changes are netted per address, so a split cannot go to the payer, or to the gas owner when `asset` is SUI. A split payment stays eligible for gasless execution when every share, the remainder included, meets the network minimum ($0.01 for USDC on mainnet).
 
 ## Testnet Resources
 

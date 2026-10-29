@@ -134,9 +134,10 @@ export function transactionCarriesNonce(
 }
 
 /**
- * The exact-payment effects check: the sum of `payTo`'s balance changes in the
- * requested asset must equal exactly `amount`. Only the recipient's credit is
- * checked; the payer's debit and other credits are not constrained.
+ * The exact-payment effects check for one recipient: the sum of `payTo`'s
+ * balance changes in the requested asset must equal exactly `amount`. Only the
+ * recipient's credit is checked; the payer's debit and other credits are not
+ * constrained.
  *
  * @param balanceChanges - Balance changes from a simulation or executed transaction
  * @param asset - The required coin type
@@ -150,19 +151,39 @@ export function matchExactPayment(
   payTo: string,
   amount: string,
 ): string | null {
+  return matchPaymentLegs(balanceChanges, asset, [{ payTo, amount: BigInt(amount) }]);
+}
+
+/**
+ * The effects check for every leg of a payment: each recipient's balance
+ * changes in the requested asset must sum to exactly its amount. Recipients
+ * must be distinct (see `parsePaymentLegs`), so each leg is checked against its
+ * own net balance change. The payer's debit and other credits are not
+ * constrained.
+ *
+ * @param balanceChanges - Balance changes from a simulation or executed transaction
+ * @param asset - The required coin type
+ * @param legs - The recipients and the exact amount each must net
+ * @returns A problem description naming the first mismatched leg, or null
+ */
+export function matchPaymentLegs(
+  balanceChanges: readonly SuiClientTypes.BalanceChange[],
+  asset: string,
+  legs: ReadonlyArray<{ payTo: string; amount: bigint }>,
+): string | null {
   const coinType = normalizeStructTag(asset);
-  const recipient = normalizeSuiAddress(payTo);
-  const want = BigInt(amount);
+  const credited = new Map<string, bigint>();
+  for (const change of balanceChanges) {
+    if (normalizeStructTag(change.coinType) !== coinType) continue;
+    const address = normalizeSuiAddress(change.address);
+    credited.set(address, (credited.get(address) ?? 0n) + BigInt(change.amount));
+  }
 
-  const got = balanceChanges
-    .filter(
-      c =>
-        normalizeStructTag(c.coinType) === coinType && normalizeSuiAddress(c.address) === recipient,
-    )
-    .reduce((sum, c) => sum + BigInt(c.amount), 0n);
-
-  if (got !== want) {
-    return `recipient ${payTo} credited ${got}, expected exactly ${want}`;
+  for (const leg of legs) {
+    const got = credited.get(normalizeSuiAddress(leg.payTo)) ?? 0n;
+    if (got !== leg.amount) {
+      return `recipient ${leg.payTo} credited ${got}, expected exactly ${leg.amount}`;
+    }
   }
 
   return null;

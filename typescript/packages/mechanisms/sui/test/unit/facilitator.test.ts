@@ -789,6 +789,234 @@ describe("ExactSuiScheme facilitator", () => {
         expect(mock.core.executeTransaction).not.toHaveBeenCalled();
       },
     );
+
+    it("rejects non-empty splits at verify and settle", async () => {
+      const requirements = testRequirements({
+        extra: { splits: [{ payTo: feePayer, amount: "100" }] },
+      });
+      const payload = await payment({}, requirements);
+      const verified = await scheme.verify(payload, requirements);
+      expect(verified.invalidReason).toBe("invalid_payment_requirements");
+      expect(verified.invalidMessage).toContain("splits");
+      expect((await scheme.settle(payload, requirements)).errorReason).toBe(
+        "invalid_payment_requirements",
+      );
+      expect(mock.core.simulateTransaction).not.toHaveBeenCalled();
+      expect(mock.core.executeTransaction).not.toHaveBeenCalled();
+    });
+
+    it("accepts an empty splits array", async () => {
+      const requirements = testRequirements({ extra: { splits: [] } });
+      const result = await scheme.verify(await payment({}, requirements), requirements);
+      expect(result.isValid).toBe(true);
+    });
+  });
+
+  describe("splits", () => {
+    const platform = `0x${"aa".repeat(32)}`;
+    const referrer = `0x${"bb".repeat(32)}`;
+    const splits = [
+      { payTo: platform, amount: "300", memo: "platform fee" },
+      { payTo: referrer, amount: "200" },
+    ];
+    const requirements = testRequirements({ extra: { splits } });
+    let splitting: ExactSuiScheme;
+
+    /**
+     * Balance changes for a payment of 10000 to the given shares.
+     *
+     * @param shares - Recipient and amount pairs
+     * @returns Balance change list
+     */
+    function credits(...shares: [string, string][]) {
+      return [
+        { coinType: USDC_TESTNET, address: payer, amount: "-10000" },
+        ...shares.map(([address, amount]) => ({ coinType: USDC_TESTNET, address, amount })),
+      ];
+    }
+    const exactSplit = credits([payTo, "9500"], [platform, "300"], [referrer, "200"]);
+
+    /**
+     * Mock the simulated balance changes.
+     *
+     * @param balanceChanges - The balance changes
+     */
+    function simulated(balanceChanges: ReturnType<typeof credits>) {
+      mock.core.simulateTransaction.mockResolvedValue({
+        $kind: "Transaction",
+        Transaction: successRecord(balanceChanges),
+      });
+    }
+
+    beforeEach(() => {
+      splitting = new ExactSuiScheme({
+        clients: { [SUI_TESTNET_CAIP2]: mock.client },
+        maxSplits: 8,
+      });
+      simulated(exactSplit);
+    });
+
+    it("advertises maxSplits with or without a fee payer", () => {
+      expect(splitting.getExtra(SUI_TESTNET_CAIP2)).toEqual({ maxSplits: 8 });
+      const sponsoring = new ExactSuiScheme({
+        feePayer,
+        executeTransaction: vi.fn(),
+        maxSplits: 2,
+      });
+      expect(sponsoring.getExtra(SUI_TESTNET_CAIP2)).toEqual({
+        feePayer,
+        maxGasBudget: "10000000",
+        maxSplits: 2,
+      });
+      expect(new ExactSuiScheme({ maxSplits: 0 }).getExtra(SUI_TESTNET_CAIP2)).toBeUndefined();
+    });
+
+    it.each([-1, 1.5, 9, Number.NaN])("rejects maxSplits %j", maxSplits => {
+      expect(() => new ExactSuiScheme({ maxSplits })).toThrow("maxSplits must be an integer");
+    });
+
+    it("verifies and settles a payment that credits each recipient its share", async () => {
+      const payload = await payment({}, requirements);
+      expect(await splitting.verify(payload, requirements)).toEqual({
+        isValid: true,
+        invalidReason: undefined,
+        payer,
+      });
+      settled(
+        successRecord(
+          exactSplit,
+          await digestOf((payload.payload as { transaction: string }).transaction),
+        ),
+      );
+      expect((await splitting.settle(payload, requirements)).success).toBe(true);
+    });
+
+    it("rejects splits by default, at verify and settle", async () => {
+      const payload = await payment({}, requirements);
+      const verified = await scheme.verify(payload, requirements);
+      expect(verified.invalidReason).toBe("invalid_payment_requirements");
+      expect(verified.invalidMessage).toContain("does not accept splits");
+      expect((await scheme.settle(payload, requirements)).errorReason).toBe(
+        "invalid_payment_requirements",
+      );
+    });
+
+    it("rejects more splits than maxSplits", async () => {
+      const one = new ExactSuiScheme({
+        clients: { [SUI_TESTNET_CAIP2]: mock.client },
+        maxSplits: 1,
+      });
+      const result = await one.verify(await payment({}, requirements), requirements);
+      expect(result.invalidReason).toBe("invalid_payment_requirements");
+      expect(result.invalidMessage).toContain("accepts at most 1");
+      expect(mock.core.simulateTransaction).not.toHaveBeenCalled();
+    });
+
+    it.each<[string, unknown]>([
+      ["a remainder of zero", [{ payTo: platform, amount: "10000" }]],
+      ["a split to payTo", [{ payTo, amount: "1" }]],
+      ["an unknown field", [{ payTo: platform, amount: "1", ataCreationRequired: false }]],
+      ["a non-array", { payTo: platform, amount: "1" }],
+    ])("rejects %s as invalid requirements", async (_, bad) => {
+      const badRequirements = testRequirements({ extra: { splits: bad } });
+      const payload = await payment({}, badRequirements);
+      expect((await splitting.verify(payload, badRequirements)).invalidReason).toBe(
+        "invalid_payment_requirements",
+      );
+      expect((await splitting.settle(payload, badRequirements)).errorReason).toBe(
+        "invalid_payment_requirements",
+      );
+      expect(mock.core.simulateTransaction).not.toHaveBeenCalled();
+      expect(mock.core.executeTransaction).not.toHaveBeenCalled();
+    });
+
+    it.each<[string, ReturnType<typeof credits>, string]>([
+      ["pays the total to payTo", credits([payTo, "10000"]), `recipient ${payTo} credited 10000`],
+      [
+        "skips a split",
+        credits([payTo, "9800"], [platform, "300"]),
+        `recipient ${payTo} credited 9800`,
+      ],
+      [
+        "underpays a split",
+        credits([payTo, "9500"], [platform, "300"], [referrer, "199"]),
+        `recipient ${referrer} credited 199`,
+      ],
+      [
+        "overpays a split",
+        credits([payTo, "9500"], [platform, "301"], [referrer, "200"]),
+        `recipient ${platform} credited 301`,
+      ],
+    ])("rejects a payment that %s", async (_, balanceChanges, message) => {
+      simulated(balanceChanges);
+      const result = await splitting.verify(await payment({}, requirements), requirements);
+      expect(result.invalidReason).toBe("invalid_exact_sui_payload_transfer_mismatch");
+      expect(result.invalidMessage).toContain(message);
+    });
+
+    it("rejects executed effects that miss a share", async () => {
+      const payload = await payment({}, requirements);
+      const digest = await digestOf((payload.payload as { transaction: string }).transaction);
+      settled(successRecord(credits([payTo, "9500"], [platform, "300"]), digest));
+      const result = await splitting.settle(payload, requirements);
+      expect(result.errorReason).toBe("settlement_effects_mismatch");
+      expect(result.errorMessage).toContain(`recipient ${referrer} credited 0`);
+    });
+
+    it("reads splits from the requirements, not from payload.accepted", async () => {
+      // The client cannot add splits: the server's requirements have none.
+      const payload = await payment({}, requirements);
+      simulated(exactBalanceChanges());
+      expect((await splitting.verify(payload, testRequirements())).isValid).toBe(true);
+    });
+
+    describe("sponsored", () => {
+      let sponsoring: ExactSuiScheme;
+      const sponsoredRequirements = testRequirements({ extra: { feePayer, splits } });
+
+      beforeEach(() => {
+        sponsoring = new ExactSuiScheme({
+          clients: { [SUI_TESTNET_CAIP2]: mock.client },
+          feePayer,
+          executeTransaction: async ({ transaction }) => ({
+            $kind: "Transaction",
+            Transaction: successRecord(exactSplit, await Transaction.from(transaction).getDigest()),
+          }),
+          maxSplits: 8,
+        });
+      });
+
+      it("verifies and settles a sponsored split payment", async () => {
+        const payload = await payment({ sponsored: true }, sponsoredRequirements);
+        expect((await sponsoring.verify(payload, sponsoredRequirements)).isValid).toBe(true);
+        const digest = await digestOf((payload.payload as { transaction: string }).transaction);
+        mock.core.waitForTransaction.mockResolvedValue({
+          $kind: "Transaction",
+          Transaction: successRecord(exactSplit, digest),
+        });
+        expect((await sponsoring.settle(payload, sponsoredRequirements)).success).toBe(true);
+      });
+
+      it("keeps the sponsorship checks", async () => {
+        const result = await sponsoring.verify(
+          await payment({ sponsored: true, useGasCoin: true }, sponsoredRequirements),
+          sponsoredRequirements,
+        );
+        expect(result.invalidReason).toBe("invalid_exact_sui_payload_sponsorship_rejected");
+      });
+
+      it("accepts the sponsor as a split recipient of a non-SUI asset", async () => {
+        const toSponsor = testRequirements({
+          extra: { feePayer, splits: [{ payTo: feePayer, amount: "100", memo: "gas" }] },
+        });
+        simulated(credits([payTo, "9900"], [feePayer, "100"]));
+        const result = await sponsoring.verify(
+          await payment({ sponsored: true }, toSponsor),
+          toSponsor,
+        );
+        expect(result.isValid).toBe(true);
+      });
+    });
   });
 
   describe("check order", () => {

@@ -10,8 +10,14 @@ import type {
   SettleResponse,
   VerifyResponse,
 } from "@x402/core/types";
-import { DEFAULT_MAX_SPONSORED_GAS_BUDGET } from "../../constants";
+import { DEFAULT_MAX_SPONSORED_GAS_BUDGET, MAX_SPLITS } from "../../constants";
 import { SettlementCache } from "../../settlement-cache";
+import {
+  assertWithinMaxSplits,
+  parsePaymentLegs,
+  SplitsError,
+  type PaymentLeg,
+} from "../../splits";
 import type {
   ExactSuiPayload,
   FacilitatorSuiOptions,
@@ -22,7 +28,7 @@ import type {
 } from "../../types";
 import {
   createSuiClientResolver,
-  matchExactPayment,
+  matchPaymentLegs,
   normalizeSignatures,
   parseBase64Bytes,
   transactionCarriesNonce,
@@ -45,6 +51,7 @@ type ValidatedPayment =
       minEpoch: string;
       maxEpoch: string;
       sponsored: boolean;
+      legs: PaymentLeg[];
     }
   | { ok: false; reason: string; message?: string; payer: string };
 
@@ -53,7 +60,8 @@ type Rejection = { reason: string; message: string };
 /**
  * Sui facilitator implementation for the Exact payment scheme. Verification is
  * effects-only: the facilitator checks that the transaction's balance changes
- * credit `payTo` with exactly `amount`, not how the transaction is built.
+ * credit `payTo` with exactly `amount`, or each split recipient with exactly
+ * its share, not how the transaction is built.
  * Sponsored payments must also pass the sponsorship checks, which bound what
  * the sponsor can be charged.
  */
@@ -66,16 +74,22 @@ export class ExactSuiScheme implements SchemeNetworkFacilitator {
   private readonly feePayer?: string;
   private readonly maxSponsoredGasBudget: bigint;
   private readonly guard: SettlementGuard;
+  private readonly maxSplits: number;
 
   /**
    * Creates a new ExactSuiScheme facilitator instance.
    *
-   * @param options - Optional client overrides, executor, fee payer, gas cap, and guard
+   * @param options - Optional client overrides, executor, fee payer, gas cap, guard, and split cap
    */
   constructor(options?: FacilitatorSuiOptions) {
     if (options?.feePayer && !options.executeTransaction) {
       throw new Error("feePayer requires executeTransaction to add the sponsor's signature");
     }
+    const maxSplits = options?.maxSplits ?? 0;
+    if (!Number.isInteger(maxSplits) || maxSplits < 0 || maxSplits > MAX_SPLITS) {
+      throw new Error(`maxSplits must be an integer from 0 to ${MAX_SPLITS}, got ${maxSplits}`);
+    }
+    this.maxSplits = maxSplits;
     this.getClient = createSuiClientResolver(options?.clients);
     this.executeTransaction = options?.executeTransaction;
     this.feePayer = options?.feePayer;
@@ -84,16 +98,23 @@ export class ExactSuiScheme implements SchemeNetworkFacilitator {
   }
 
   /**
-   * Advertise the fee payer and its gas budget cap when one is configured.
+   * Advertise the fee payer and its gas budget cap when one is configured, and
+   * `maxSplits` when splits are accepted.
    *
    * @param _ - The network identifier (unused)
-   * @returns `{ feePayer, maxGasBudget }` when a fee payer is set, otherwise undefined
+   * @returns The advertised extras, or undefined when there are none
    */
   getExtra(_: Network): Record<string, unknown> | undefined {
     void _;
-    return this.feePayer
-      ? { feePayer: this.feePayer, maxGasBudget: String(this.maxSponsoredGasBudget) }
-      : undefined;
+    const extra: Record<string, unknown> = {};
+    if (this.feePayer) {
+      extra.feePayer = this.feePayer;
+      extra.maxGasBudget = String(this.maxSponsoredGasBudget);
+    }
+    if (this.maxSplits > 0) {
+      extra.maxSplits = this.maxSplits;
+    }
+    return Object.keys(extra).length > 0 ? extra : undefined;
   }
 
   /**
@@ -129,7 +150,7 @@ export class ExactSuiScheme implements SchemeNetworkFacilitator {
           payer: validated.payer,
         };
       }
-      const { transactionBytes, sender, digest } = validated;
+      const { transactionBytes, sender, digest, legs } = validated;
       const client = this.getClient(requirements.network);
 
       // Simulating an executed address-balance transaction still succeeds, so
@@ -143,7 +164,7 @@ export class ExactSuiScheme implements SchemeNetworkFacilitator {
         };
       }
 
-      const rejection = await this.simulate(client, transactionBytes, requirements);
+      const rejection = await this.simulate(client, transactionBytes, requirements.asset, legs);
       if (rejection) {
         return {
           isValid: false,
@@ -239,6 +260,7 @@ export class ExactSuiScheme implements SchemeNetworkFacilitator {
         sender,
         validated.sponsored,
         requirements,
+        validated.legs,
       );
     } catch (error) {
       result = failure("transaction_failed", errorMessage(error), sender);
@@ -286,6 +308,15 @@ export class ExactSuiScheme implements SchemeNetworkFacilitator {
         message: `amount must be a positive integer, got ${String(requirements.amount)}`,
         payer: "",
       };
+    }
+    // Splits come from the server's requirements, never from payload.accepted.
+    let legs: PaymentLeg[];
+    try {
+      legs = parsePaymentLegs(requirements);
+      assertWithinMaxSplits(legs, this.maxSplits);
+    } catch (error) {
+      if (!(error instanceof SplitsError)) throw error;
+      return { ok: false, reason: error.reason, message: error.detail, payer: "" };
     }
 
     let client: ClientWithCoreApi;
@@ -355,6 +386,7 @@ export class ExactSuiScheme implements SchemeNetworkFacilitator {
       minEpoch: expiration.minEpoch,
       maxEpoch: expiration.maxEpoch,
       sponsored,
+      legs,
     };
   }
 
@@ -448,6 +480,7 @@ export class ExactSuiScheme implements SchemeNetworkFacilitator {
    * @param sender - The transaction sender
    * @param sponsored - Whether this facilitator sponsors the payment
    * @param requirements - The payment requirements
+   * @param legs - The recipients and their exact shares
    * @returns The settlement response
    */
   private async submit(
@@ -457,6 +490,7 @@ export class ExactSuiScheme implements SchemeNetworkFacilitator {
     sender: string,
     sponsored: boolean,
     requirements: PaymentRequirements,
+    legs: readonly PaymentLeg[],
   ): Promise<SettleResponse> {
     const network = requirements.network;
     const signatures = normalizeSignatures(suiPayload.signature) ?? [];
@@ -554,7 +588,7 @@ export class ExactSuiScheme implements SchemeNetworkFacilitator {
       transaction = fetched.Transaction;
     }
 
-    const problem = this.matchRecipients(transaction.balanceChanges, requirements);
+    const problem = matchPaymentLegs(transaction.balanceChanges, requirements.asset, legs);
     if (problem) {
       return {
         success: false,
@@ -569,17 +603,19 @@ export class ExactSuiScheme implements SchemeNetworkFacilitator {
   }
 
   /**
-   * Simulate the payment (at verify) and check the recipient's credit.
+   * Simulate the payment (at verify) and check each recipient's credit.
    *
    * @param client - The Sui client
    * @param transactionBytes - The transaction bytes
-   * @param requirements - The payment requirements
+   * @param asset - The required coin type
+   * @param legs - The recipients and their exact shares
    * @returns A rejection, or null when the simulated effects match
    */
   private async simulate(
     client: ClientWithCoreApi,
     transactionBytes: Uint8Array,
-    requirements: PaymentRequirements,
+    asset: string,
+    legs: readonly PaymentLeg[],
   ): Promise<Rejection | null> {
     // Without `doGasSelection: false`, gRPC and GraphQL fullnodes may replace an
     // empty gas payment with the gas owner's coins, so the simulation would not
@@ -595,7 +631,7 @@ export class ExactSuiScheme implements SchemeNetworkFacilitator {
         message: simulation.FailedTransaction.status.error?.message ?? "simulation failed",
       };
     }
-    const problem = this.matchRecipients(simulation.Transaction.balanceChanges, requirements);
+    const problem = matchPaymentLegs(simulation.Transaction.balanceChanges, asset, legs);
     return problem
       ? { reason: "invalid_exact_sui_payload_transfer_mismatch", message: problem }
       : null;
@@ -617,25 +653,6 @@ export class ExactSuiScheme implements SchemeNetworkFacilitator {
     } catch {
       return null;
     }
-  }
-
-  /**
-   * The recipient check: `payTo` must net exactly `amount`.
-   *
-   * @param balanceChanges - The simulated or executed balance changes
-   * @param requirements - The payment requirements
-   * @returns A problem description, or null when the effects match
-   */
-  private matchRecipients(
-    balanceChanges: readonly SuiClientTypes.BalanceChange[],
-    requirements: PaymentRequirements,
-  ): string | null {
-    return matchExactPayment(
-      balanceChanges,
-      requirements.asset,
-      requirements.payTo,
-      requirements.amount,
-    );
   }
 
   /**

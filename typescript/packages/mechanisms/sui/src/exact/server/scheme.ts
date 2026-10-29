@@ -12,11 +12,13 @@ import type {
 } from "@x402/core/types";
 import { convertToTokenAmount, parseMoney } from "@x402/core/utils";
 import { findDefaultAsset, getDefaultAsset } from "../../defaultAssets";
+import { assertWithinMaxSplits, getMaxSplits, hasSplits, parsePaymentLegs } from "../../splits";
 
 /**
  * Sui server implementation for the Exact payment scheme. Parses prices into
- * atomic USDC amounts and passes any operator-set `extra.nonce` through
- * untouched (auto-generating one would break requirement matching).
+ * atomic USDC amounts and passes any operator-set `extra.nonce` and
+ * `extra.splits` through untouched (auto-generating a nonce would break
+ * requirement matching).
  */
 export class ExactSuiScheme implements SchemeNetworkServer {
   readonly scheme = "exact";
@@ -84,7 +86,8 @@ export class ExactSuiScheme implements SchemeNetworkServer {
 
   /**
    * Build payment requirements: merge the facilitator's advertised extras
-   * (e.g. `feePayer`) and reject a non-positive amount.
+   * (e.g. `feePayer`), and reject a non-positive amount or `extra.splits` that
+   * break the splits rules or exceed the facilitator's advertised `maxSplits`.
    *
    * @param paymentRequirements - The base payment requirements
    * @param supportedKind - The supported kind from the facilitator's /supported endpoint
@@ -98,15 +101,28 @@ export class ExactSuiScheme implements SchemeNetworkServer {
   ): Promise<PaymentRequirements> {
     void facilitatorExtensions;
 
+    // maxSplits is a facilitator capability, not a payment term.
+    const { maxSplits: _maxSplits, ...advertised } = supportedKind.extra ?? {};
+    void _maxSplits;
     const extra: Record<string, unknown> = {
       ...paymentRequirements.extra,
-      ...supportedKind.extra,
+      ...advertised,
     };
 
     try {
       this.assertPositiveAmount(paymentRequirements.amount);
     } catch (error) {
       return Promise.reject(error);
+    }
+    // A server MUST NOT issue splits its facilitator does not advertise, so a
+    // misconfigured route fails here rather than at verify after the client signed.
+    if (hasSplits({ extra })) {
+      try {
+        const legs = parsePaymentLegs({ ...paymentRequirements, extra });
+        assertWithinMaxSplits(legs, getMaxSplits(supportedKind.extra));
+      } catch (error) {
+        return Promise.reject(error);
+      }
     }
 
     return Promise.resolve({ ...paymentRequirements, extra });

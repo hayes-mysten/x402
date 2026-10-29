@@ -1,8 +1,14 @@
+import { bcs } from "@mysten/sui/bcs";
 import type { ClientWithCoreApi } from "@mysten/sui/client";
+import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
 import type { Signer } from "@mysten/sui/cryptography";
 import { SuiJsonRpcClient } from "@mysten/sui/jsonRpc";
 import { Transaction } from "@mysten/sui/transactions";
-import { normalizeStructTag, normalizeSuiAddress } from "@mysten/sui/utils";
+import {
+  fromBase64 as decodeBase64,
+  normalizeStructTag,
+  normalizeSuiAddress,
+} from "@mysten/sui/utils";
 import { verifyTransactionSignature } from "@mysten/sui/verify";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ExactSuiScheme } from "../../src/exact/client/scheme";
@@ -16,6 +22,7 @@ import {
   fromBase64,
   payer,
   payerKeypair,
+  payTo,
   testRequirements,
 } from "./helpers";
 
@@ -90,6 +97,29 @@ function resolvingClient(suiBalances: Record<string, string> = {}) {
  */
 function decode(payload: unknown) {
   return Transaction.from((payload as ExactSuiPayload).transaction).getData();
+}
+
+/**
+ * The `send_funds` legs of a client-built transaction, in command order. Each
+ * leg is funded by a `redeem_funds` of one sender withdrawal.
+ *
+ * @param payload - The payment payload
+ * @returns Each leg's recipient and withdrawn amount
+ */
+function sentLegs(payload: unknown): { payTo: string; amount: string }[] {
+  const data = decode(payload);
+  const inputAt = (arg: unknown) => data.inputs[(arg as { Input: number }).Input];
+  return data.commands
+    .filter(c => c.MoveCall?.function === "send_funds")
+    .map(c => {
+      const [funds, recipient] = c.MoveCall!.arguments;
+      const redeem = data.commands[(funds as { NestedResult: [number, number] }).NestedResult[0]];
+      const withdrawal = inputAt(redeem.MoveCall!.arguments[0]).FundsWithdrawal!;
+      return {
+        payTo: bcs.Address.parse(decodeBase64(inputAt(recipient).Pure!.bytes)),
+        amount: String(withdrawal.reservation.MaxAmountU64),
+      };
+    });
 }
 
 describe("ExactSuiScheme client", () => {
@@ -248,5 +278,101 @@ describe("ExactSuiScheme client", () => {
       "positive atomic-unit integer",
     );
     expect(mock.core.getCurrentSystemState).not.toHaveBeenCalled();
+  });
+
+  describe("splits", () => {
+    const platform = new Ed25519Keypair().toSuiAddress();
+    const referrer = new Ed25519Keypair().toSuiAddress();
+    const splits = [
+      { payTo: platform, amount: "300", memo: "platform fee" },
+      { payTo: referrer, amount: "200" },
+    ];
+    const requirements = testRequirements({ amount: "10000", extra: { splits } });
+
+    /**
+     * A client with the given consent hook.
+     *
+     * @param approveSplits - The consent hook
+     * @returns The client scheme
+     */
+    function withApproval(approveSplits?: () => boolean | Promise<boolean>) {
+      return new ExactSuiScheme(payerKeypair, {
+        clients: { [SUI_TESTNET_CAIP2]: mock.client },
+        approveSplits,
+      });
+    }
+
+    it("refuses splits without approveSplits", async () => {
+      await expect(scheme.createPaymentPayload(2, requirements)).rejects.toThrow(
+        "set approveSplits",
+      );
+      expect(mock.core.getCurrentSystemState).not.toHaveBeenCalled();
+    });
+
+    it("refuses splits that approveSplits rejects", async () => {
+      const approve = vi.fn().mockResolvedValue(false);
+      await expect(withApproval(approve).createPaymentPayload(2, requirements)).rejects.toThrow(
+        "were not approved",
+      );
+      expect(mock.core.getCurrentSystemState).not.toHaveBeenCalled();
+    });
+
+    it("passes the splits and the remainder to approveSplits", async () => {
+      const approve = vi.fn().mockReturnValue(true);
+      await withApproval(approve).createPaymentPayload(2, requirements);
+      expect(approve).toHaveBeenCalledOnce();
+      expect(approve).toHaveBeenCalledWith(splits, {
+        payTo,
+        primaryAmount: "9500",
+        requirements,
+      });
+    });
+
+    it("does not ask for consent without splits", async () => {
+      const approve = vi.fn().mockReturnValue(true);
+      await withApproval(approve).createPaymentPayload(
+        2,
+        testRequirements({ extra: { splits: [] } }),
+      );
+      expect(approve).not.toHaveBeenCalled();
+    });
+
+    it("sends the remainder to payTo and each split its share", async () => {
+      const result = await withApproval(() => true).createPaymentPayload(2, requirements);
+      expect(sentLegs(result.payload)).toEqual([
+        { payTo: normalizeSuiAddress(payTo), amount: "9500" },
+        { payTo: normalizeSuiAddress(platform), amount: "300" },
+        { payTo: normalizeSuiAddress(referrer), amount: "200" },
+      ]);
+    });
+
+    it("builds a single leg for a single-payee payment", async () => {
+      const result = await scheme.createPaymentPayload(2, testRequirements());
+      expect(sentLegs(result.payload)).toEqual([
+        { payTo: normalizeSuiAddress(payTo), amount: "10000" },
+      ]);
+    });
+
+    it("does not use the gas coin on any leg of a sponsored SUI payment", async () => {
+      const result = await withApproval(() => true).createPaymentPayload(
+        2,
+        testRequirements({ asset: "0x2::sui::SUI", extra: { feePayer, splits } }),
+      );
+      const data = decode(result.payload);
+      expect(JSON.stringify(data.commands)).not.toContain("GasCoin");
+      expect(data.commands.filter(c => c.MoveCall?.function === "send_funds")).toHaveLength(3);
+    });
+
+    it.each([
+      ["a remainder of zero", [{ payTo: platform, amount: "10000" }]],
+      ["a duplicate recipient", [{ payTo, amount: "1" }]],
+      ["an unknown field", [{ payTo: platform, amount: "1", ataCreationRequired: false }]],
+    ])("refuses %s before asking for consent", async (_, bad) => {
+      const approve = vi.fn().mockReturnValue(true);
+      await expect(
+        withApproval(approve).createPaymentPayload(2, testRequirements({ extra: { splits: bad } })),
+      ).rejects.toThrow("invalid_payment_requirements");
+      expect(approve).not.toHaveBeenCalled();
+    });
   });
 });

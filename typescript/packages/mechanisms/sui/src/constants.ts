@@ -53,3 +53,16 @@ export const NONCE_GASLESS_PURE_BYTES = 32;
  * roughly 200,000 MIST on mainnet and 2,000,000 MIST on testnet.
  */
 export const DEFAULT_MAX_SPONSORED_GAS_BUDGET = 10_000_000n;
+
+/**
+ * Most `extra.splits` entries any facilitator accepts (9 recipients with
+ * `payTo`), the same as Solana. Sui allows 10 balance withdrawals per
+ * transaction, counting gas paid from an address balance, so one withdrawal per
+ * recipient fits 9 recipients.
+ */
+export const MAX_SPLITS = 8;
+
+/**
+ * Largest `extra.splits[].memo`, in UTF-8 bytes, the same as Solana.
+ */
+export const MAX_SPLIT_MEMO_BYTES = 566;

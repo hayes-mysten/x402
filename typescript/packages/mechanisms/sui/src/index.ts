@@ -15,6 +15,9 @@ export {
   type SuiDefaultAsset,
 } from "./defaultAssets";
 
+// Multi-payee splits
+export * from "./splits";
+
 // Utils
 export * from "./utils";
 

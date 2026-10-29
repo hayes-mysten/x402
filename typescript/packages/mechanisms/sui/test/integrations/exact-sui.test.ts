@@ -31,10 +31,16 @@ import type {
   VerifyResponse,
 } from "@x402/core/types";
 import { beforeAll, describe, expect, it } from "vitest";
-import { SUI_TESTNET_CAIP2, USDC_TESTNET } from "../../src/constants";
+import {
+  DEFAULT_MAX_SPONSORED_GAS_BUDGET,
+  MAX_SPLITS,
+  SUI_TESTNET_CAIP2,
+  USDC_TESTNET,
+} from "../../src/constants";
 import { ExactSuiScheme as ExactSuiClient } from "../../src/exact/client";
 import { ExactSuiScheme as ExactSuiFacilitator } from "../../src/exact/facilitator";
 import { ExactSuiScheme as ExactSuiServer } from "../../src/exact/server";
+import type { ExactSuiSplit } from "../../src/splits";
 import type { ExactSuiPayload, SuiExecutor } from "../../src/types";
 
 const CLIENT_PRIVATE_KEY = process.env.SUI_CLIENT_PRIVATE_KEY;
@@ -123,11 +129,13 @@ const sponsorExecutor: SuiExecutor = async ({ transaction, signatures }) => {
  * A facilitator scheme on testnet, sponsoring gas when asked.
  *
  * @param sponsored - Whether to advertise the sponsor as `feePayer`
+ * @param maxSplits - The number of splits to accept
  * @returns The facilitator scheme
  */
-function facilitatorScheme(sponsored = false): ExactSuiFacilitator {
+function facilitatorScheme(sponsored = false, maxSplits = 0): ExactSuiFacilitator {
   return new ExactSuiFacilitator({
     clients: { [NETWORK]: suiClient },
+    maxSplits,
     ...(sponsored
       ? { feePayer: sponsorKeypair!.toSuiAddress(), executeTransaction: sponsorExecutor }
       : {}),
@@ -151,14 +159,18 @@ async function resourceServer(scheme: ExactSuiFacilitator): Promise<x402Resource
 /**
  * An x402 client paying from the test payer; SUI is allowed past spend controls.
  *
+ * @param approveSplits - Whether the client consents to splits
  * @returns The client
  */
-function payerClient(): x402Client {
+function payerClient(approveSplits = false): x402Client {
   return x402Client.fromConfig({
     schemes: [
       {
         network: "sui:*",
-        client: new ExactSuiClient(clientKeypair!, { clients: { [NETWORK]: suiClient } }),
+        client: new ExactSuiClient(clientKeypair!, {
+          clients: { [NETWORK]: suiClient },
+          ...(approveSplits ? { approveSplits: () => true } : {}),
+        }),
       },
     ],
     spendControls: { allowedAssets: [{ network: NETWORK, asset: SUI }] },
@@ -203,7 +215,53 @@ async function pay(
   requirements: PaymentRequirements,
 ): Promise<PaymentPayload> {
   const paymentRequired = await server.createPaymentRequiredResponse([requirements], resource);
-  return payerClient().createPaymentPayload(paymentRequired);
+  return payerClient(true).createPaymentPayload(paymentRequired);
+}
+
+/**
+ * Requirements for a SUI payment of `AMOUNT` split between `payTo` and fresh
+ * recipients of `share` each.
+ *
+ * @param server - The resource server
+ * @param count - The number of splits
+ * @param share - Each split's amount, in MIST
+ * @returns The requirement, `payTo`, and the splits
+ */
+async function splitRequirements(
+  server: x402ResourceServer,
+  count: number,
+  share: bigint,
+): Promise<{ requirements: PaymentRequirements; payTo: string; splits: ExactSuiSplit[] }> {
+  const payTo = new Ed25519Keypair().toSuiAddress();
+  const splits = Array.from({ length: count }, (_, i) => ({
+    payTo: new Ed25519Keypair().toSuiAddress(),
+    amount: String(share),
+    memo: `split ${i}`,
+  }));
+  const [requirements] = await server.buildPaymentRequirements({
+    scheme: "exact",
+    network: NETWORK,
+    payTo,
+    price: { amount: AMOUNT, asset: SUI, extra: { splits } },
+  });
+  return { requirements, payTo, splits };
+}
+
+/**
+ * The gas an executed transaction used, and its budget.
+ *
+ * @param digest - The transaction digest
+ * @returns Net gas used (computation + storage - rebate), its parts, and the budget
+ */
+async function gasOf(digest: string) {
+  const tx = await suiClient.core.waitForTransaction({
+    digest,
+    include: { effects: true, transaction: true },
+  });
+  const record = tx.Transaction ?? tx.FailedTransaction!;
+  const used = record.effects!.gasUsed;
+  const net = BigInt(used.computationCost) + BigInt(used.storageCost) - BigInt(used.storageRebate);
+  return { net, used, budget: BigInt(record.transaction!.gasData.budget ?? 0) };
 }
 
 /**
@@ -410,6 +468,74 @@ describeLive("Sui Integration Tests", () => {
         const requirements = await suiRequirements(server, new Ed25519Keypair().toSuiAddress());
         const capped = { ...requirements, extra: { ...requirements.extra, maxGasBudget: "1" } };
         await expect(pay(server, capped)).rejects.toThrow("exceeds the sponsor's maxGasBudget");
+      },
+    );
+  });
+
+  describe("splits", () => {
+    it("settles a self-paid SUI payment split three ways", { timeout: TIMEOUT }, async () => {
+      const server = await resourceServer(facilitatorScheme(false, 2));
+      const { requirements, payTo, splits } = await splitRequirements(server, 2, 300n);
+      expect(requirements.extra?.splits).toEqual(splits);
+      expect(requirements.extra?.maxSplits).toBeUndefined();
+
+      const payload = await pay(server, requirements);
+      expect(await server.verifyPayment(payload, requirements)).toMatchObject({ isValid: true });
+      const settled = await server.settlePayment(payload, requirements);
+      expect(settled).toMatchObject({ success: true });
+
+      expect(await suiChange(settled.transaction, payTo)).toBe(BigInt(AMOUNT) - 600n);
+      for (const split of splits) {
+        expect(await suiChange(settled.transaction, split.payTo)).toBe(300n);
+      }
+    });
+
+    it("refuses splits the facilitator does not advertise", { timeout: TIMEOUT }, async () => {
+      const server = await resourceServer(facilitatorScheme(false, 1));
+      await expect(splitRequirements(server, 2, 100n)).rejects.toThrow("accepts at most 1");
+    });
+
+    it("makes the client refuse splits without approveSplits", { timeout: TIMEOUT }, async () => {
+      const server = await resourceServer(facilitatorScheme(false, 1));
+      const { requirements } = await splitRequirements(server, 1, 100n);
+      const paymentRequired = await server.createPaymentRequiredResponse([requirements], resource);
+      await expect(payerClient().createPaymentPayload(paymentRequired)).rejects.toThrow(
+        "set approveSplits",
+      );
+    });
+
+    itSponsored(
+      `settles a sponsored SUI payment with ${MAX_SPLITS} splits under the default gas cap`,
+      { timeout: TIMEOUT },
+      async () => {
+        const server = await resourceServer(facilitatorScheme(true, MAX_SPLITS));
+        const { requirements, payTo, splits } = await splitRequirements(server, MAX_SPLITS, 100n);
+        expect(requirements.extra?.maxGasBudget).toBe(String(DEFAULT_MAX_SPONSORED_GAS_BUDGET));
+
+        const payload = await pay(server, requirements);
+        const tx = Transaction.from((payload.payload as ExactSuiPayload).transaction).getData();
+        expect(tx.gasData.owner).toBe(sponsorKeypair!.toSuiAddress());
+
+        const payer = clientKeypair!.toSuiAddress();
+        expect(await server.verifyPayment(payload, requirements)).toMatchObject({ isValid: true });
+        const settled = await server.settlePayment(payload, requirements);
+        expect(settled).toMatchObject({ success: true, payer });
+
+        expect(await suiChange(settled.transaction, payer)).toBe(-BigInt(AMOUNT));
+        expect(await suiChange(settled.transaction, payTo)).toBe(
+          BigInt(AMOUNT) - 100n * BigInt(MAX_SPLITS),
+        );
+        for (const split of splits) {
+          expect(await suiChange(settled.transaction, split.payTo)).toBe(100n);
+        }
+
+        const gas = await gasOf(settled.transaction);
+        console.info(
+          `[exact-sui] sponsored payment, ${MAX_SPLITS} splits: budget ${gas.budget}, ` +
+            `computation ${gas.used.computationCost}, storage ${gas.used.storageCost}, ` +
+            `rebate ${gas.used.storageRebate}, net ${gas.net} MIST`,
+        );
+        expect(gas.budget).toBeLessThanOrEqual(DEFAULT_MAX_SPONSORED_GAS_BUDGET);
       },
     );
   });

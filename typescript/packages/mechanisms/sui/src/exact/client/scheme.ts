@@ -8,15 +8,18 @@ import type {
   PaymentRequirements,
   SchemeNetworkClient,
 } from "@x402/core/types";
-import type { ExactSuiPayload, SuiClientOptions } from "../../types";
+import type { ClientSuiOptions, ExactSuiPayload } from "../../types";
 import { findDefaultAsset } from "../../defaultAssets";
+import { getSplits, parsePaymentLegs, type ApproveSplits } from "../../splits";
 import { createSuiClientResolver, parseBase64Bytes, type SuiClientResolver } from "../../utils";
 
 /**
  * Sui client implementation for the Exact payment scheme. Builds and signs (but
  * does not execute) a `balance::send_funds` of `amount` to `payTo`, valid for
- * the current and next epoch. An advertised `feePayer` becomes the gas owner,
- * and a declared server `nonce` is carried as a `Pure` input.
+ * the current and next epoch. With `extra.splits`, it sends the remainder to
+ * `payTo` and each split its share, after `approveSplits` consents. An
+ * advertised `feePayer` becomes the gas owner, and a declared server `nonce` is
+ * carried as a `Pure` input.
  */
 export class ExactSuiScheme implements SchemeNetworkClient {
   readonly scheme = "exact";
@@ -24,18 +27,20 @@ export class ExactSuiScheme implements SchemeNetworkClient {
 
   private readonly getClient: SuiClientResolver;
   private readonly chainIds = new Map<Network, Promise<string>>();
+  private readonly approveSplits?: ApproveSplits;
 
   /**
    * Creates a new ExactSuiScheme client instance.
    *
    * @param signer - Any Sui signer (Ed25519Keypair, Secp256k1Keypair, wallet-backed, ...)
-   * @param options - Optional per-network Sui client overrides
+   * @param options - Optional per-network Sui client overrides and the `approveSplits` hook
    */
   constructor(
     private readonly signer: Signer,
-    options?: SuiClientOptions,
+    options?: ClientSuiOptions,
   ) {
     this.getClient = createSuiClientResolver(options?.clients);
+    this.approveSplits = options?.approveSplits;
   }
 
   /**
@@ -59,6 +64,27 @@ export class ExactSuiScheme implements SchemeNetworkClient {
     if (!amount || !/^[0-9]+$/.test(amount) || BigInt(amount) <= 0n) {
       throw new Error(`Amount must be a positive atomic-unit integer: ${amount}`);
     }
+    // The remainder to payTo first, then each split. Without splits, one leg.
+    const legs = parsePaymentLegs(paymentRequirements);
+    const splits = getSplits(paymentRequirements);
+    if (splits.length > 0) {
+      if (!this.approveSplits) {
+        throw new Error(
+          "Payment requirements carry extra.splits; set approveSplits in the client options to consent to them",
+        );
+      }
+      const approved = await this.approveSplits(
+        splits.map(({ payTo, amount, memo }) => ({ payTo, amount, memo })),
+        {
+          payTo,
+          primaryAmount: legs[0].amount.toString(),
+          requirements: paymentRequirements,
+        },
+      );
+      if (approved !== true) {
+        throw new Error("Splits in the payment requirements were not approved");
+      }
+    }
     const coinType = normalizeStructTag(asset);
 
     // A nonce over 32 bytes is valid but forfeits gasless (NONCE_GASLESS_PURE_BYTES).
@@ -77,15 +103,17 @@ export class ExactSuiScheme implements SchemeNetworkClient {
 
     const tx = new Transaction();
     tx.setSender(this.signer.toSuiAddress());
-    tx.moveCall({
-      target: "0x2::balance::send_funds",
-      typeArguments: [coinType],
-      arguments: [
-        // The sponsor rejects use of its gas coin, so a SUI payment must not draw on it.
-        tx.balance({ type: coinType, balance: BigInt(amount), useGasCoin: !sponsored }),
-        tx.pure.address(payTo),
-      ],
-    });
+    for (const leg of legs) {
+      tx.moveCall({
+        target: "0x2::balance::send_funds",
+        typeArguments: [coinType],
+        arguments: [
+          // The sponsor rejects use of its gas coin, so a SUI payment must not draw on it.
+          tx.balance({ type: coinType, balance: leg.amount, useGasCoin: !sponsored }),
+          tx.pure.address(leg.payTo),
+        ],
+      });
+    }
     // Raw bytes, not a BCS vector, so the decoded `Pure.bytes` is exactly the nonce.
     if (nonceBytes) {
       tx.pure(nonceBytes);

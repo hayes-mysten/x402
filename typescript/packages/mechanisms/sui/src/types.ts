@@ -1,4 +1,5 @@
 import type { ClientWithCoreApi, SuiClientTypes } from "@mysten/sui/client";
+import type { ApproveSplits } from "./splits";
 
 /**
  * Exact Sui payload: the client-signed transaction. On a facilitator-sponsored
@@ -87,6 +88,22 @@ export type SuiClientOptions = {
 };
 
 /**
+ * Client options.
+ */
+export type ClientSuiOptions = SuiClientOptions & {
+  /**
+   * Consent hook for multi-payee splits. Called before signing whenever the
+   * requirements carry a non-empty `extra.splits`, with the splits and the
+   * remainder reaching `payTo`. Return `true` only when every recipient, amount
+   * and memo matches the terms the payer agreed to.
+   *
+   * When unset, requirements with splits are refused: a server could otherwise
+   * add recipients and divert part of the payment.
+   */
+  approveSplits?: ApproveSplits;
+};
+
+/**
  * Facilitator options.
  */
 export type FacilitatorSuiOptions = SuiClientOptions & {
@@ -104,6 +121,12 @@ export type FacilitatorSuiOptions = SuiClientOptions & {
    * {@link DEFAULT_MAX_SPONSORED_GAS_BUDGET}.
    */
   maxSponsoredGasBudget?: bigint;
+  /**
+   * Most `extra.splits` entries accepted, 0 to {@link MAX_SPLITS}. Advertised
+   * as `maxSplits` in `/supported` when above 0. Defaults to 0: splits are not
+   * accepted or advertised.
+   */
+  maxSplits?: number;
   /**
    * Settlement dedup guard. Defaults to an in-process {@link SettlementCache}.
    */
